@@ -10,7 +10,7 @@ STRATEGY_PATH="${RMV5_STRATEGY_PATH:-/opt/rmv5/strategies}"
 DATA_ROOT="${ADAPTIVE_DATA_ROOT:-/freqtrade/user_data/data/binance/futures}"
 WALLET="${ADAPTIVE_BACKTEST_WALLET:-100}"
 MAX_TRADES="${ADAPTIVE_MAX_OPEN_TRADES:-20}"
-RANKING="${ADAPTIVE_RANKING:-coingecko}"
+RANKING="${ADAPTIVE_RANKING:-volume}"
 EMERGENCY_STOP="${ADAPTIVE_EMERGENCY_PRICE_STOP:-0.035}"
 
 START_FT="${START//-/}"
@@ -37,6 +37,7 @@ freqtrade download-data \
   --timerange "$DOWNLOAD_RANGE"
 
 echo "=== 2/4 BUILD MONTHLY WALK-FORWARD SCHEDULE ==="
+echo "Ranking source: $RANKING"
 python /opt/rmv5/tools/build_adaptive_schedule.py \
   --config "$LIVE_CONFIG" \
   --data-root "$DATA_ROOT" \

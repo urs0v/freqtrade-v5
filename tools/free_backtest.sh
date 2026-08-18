@@ -12,7 +12,7 @@ END_FT="${END//-/}"
 TIMERANGE="${START_FT}-${END_FT}"
 
 echo "=== 1/3 FREE BINANCE DERIVATIVES BACKFILL ==="
-python /opt/rmv5/tools/backfill_free.py \
+python /opt/rmv5/tools/backfill_free_fixed.py \
   --start "$START" \
   --end "$END" \
   --db "$HIST_DB"

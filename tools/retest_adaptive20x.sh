@@ -12,6 +12,8 @@ WALLET="${ADAPTIVE_BACKTEST_WALLET:-100}"
 MAX_TRADES="${ADAPTIVE_MAX_OPEN_TRADES:-20}"
 RANKING="${ADAPTIVE_RANKING:-volume}"
 EMERGENCY_STOP="${ADAPTIVE_EMERGENCY_PRICE_STOP:-0.035}"
+MAX_STOP_RATE="${ADAPTIVE_MAX_TRAIN_STOP_RATE:-0.25}"
+MIN_TRAIN_TRADES="${ADAPTIVE_MIN_TRAIN_TRADES:-2}"
 
 START_FT="${START//-/}"
 END_FT="${END//-/}"
@@ -36,8 +38,9 @@ freqtrade download-data \
   --timeframes 5m 6h \
   --timerange "$DOWNLOAD_RANGE"
 
-echo "=== 2/4 BUILD MONTHLY WALK-FORWARD SCHEDULE ==="
+echo "=== 2/4 BUILD 20X-AWARE MONTHLY WALK-FORWARD SCHEDULE ==="
 echo "Ranking source: $RANKING"
+echo "Optimizer: 20x | emergency stop=${EMERGENCY_STOP} price | max training stop-rate=${MAX_STOP_RATE}"
 python /opt/rmv5/tools/build_adaptive_schedule.py \
   --config "$LIVE_CONFIG" \
   --data-root "$DATA_ROOT" \
@@ -45,7 +48,11 @@ python /opt/rmv5/tools/build_adaptive_schedule.py \
   --end "$END" \
   --output "$SCHEDULE" \
   --ranking "$RANKING" \
-  --fee 0.0004
+  --fee 0.0004 \
+  --leverage 20 \
+  --emergency-stop "$EMERGENCY_STOP" \
+  --max-stop-rate "$MAX_STOP_RATE" \
+  --min-trades "$MIN_TRAIN_TRADES"
 
 echo "=== 3/4 BUILD 20X BACKTEST CONFIG ==="
 python - "$LIVE_CONFIG" "$TEST_CONFIG" "$WALLET" "$MAX_TRADES" <<'PY'

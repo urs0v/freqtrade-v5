@@ -13,8 +13,8 @@ services:
       FREQTRADE__API_SERVER__PASSWORD: "CHANGE_THIS"
     volumes:
       - rmv5_data:/freqtrade/user_data
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
 
 volumes:
   rmv5_data:

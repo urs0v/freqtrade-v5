@@ -1,7 +1,7 @@
 from pathlib import Path
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -53,10 +53,7 @@ class RegimeMomentumV5(IStrategy):
     feature_db = os.environ.get("RMV5_FEATURE_DB", "/freqtrade/user_data/v5/features.sqlite")
 
     plot_config = {
-        "main_plot": {
-            "ema50_1h": {},
-            "ema200_1h": {},
-        },
+        "main_plot": {"ema50_1h": {}, "ema200_1h": {}},
         "subplots": {
             "6h": {"mom_6h": {}, "adx_6h": {}},
             "Derivatives": {"oi_chg": {}, "funding": {}, "liq_z": {}},
@@ -93,12 +90,9 @@ class RegimeMomentumV5(IStrategy):
 
     def _load_external_features(self, pair: str, dataframe: DataFrame) -> DataFrame:
         out = dataframe.copy()
-        out["oi"] = np.nan
-        out["funding"] = np.nan
-        out["long_liq"] = np.nan
-        out["short_liq"] = np.nan
-        out["taker_ratio"] = np.nan
-        out["top_ls_ratio"] = np.nan
+        for c in ["oi", "funding", "long_liq", "short_liq", "taker_ratio", "top_ls_ratio"]:
+            out[c] = np.nan
+        out["liq_observed"] = 0.0
 
         db = Path(self.feature_db)
         if not db.exists() or dataframe.empty:
@@ -110,12 +104,21 @@ class RegimeMomentumV5(IStrategy):
 
         try:
             with sqlite3.connect(db) as conn:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(features)")}
+                liq_expr = "liq_observed" if "liq_observed" in cols else "1 AS liq_observed"
                 feat = pd.read_sql_query(
-                    """
-                    SELECT ts, oi, funding, long_liq, short_liq, taker_ratio, top_ls_ratio
+                    f"""
+                    SELECT bucket_ms AS ts,
+                           oi,
+                           funding_rate AS funding,
+                           long_liq_usdt AS long_liq,
+                           short_liq_usdt AS short_liq,
+                           taker_ratio,
+                           top_ls_ratio,
+                           {liq_expr}
                     FROM features
-                    WHERE symbol = ? AND ts BETWEEN ? AND ?
-                    ORDER BY ts
+                    WHERE symbol = ? AND bucket_ms BETWEEN ? AND ?
+                    ORDER BY bucket_ms
                     """,
                     conn,
                     params=(symbol, start_ms, end_ms),
@@ -138,7 +141,7 @@ class RegimeMomentumV5(IStrategy):
             suffixes=("", "_ext"),
         )
 
-        for c in ["oi", "funding", "long_liq", "short_liq", "taker_ratio", "top_ls_ratio"]:
+        for c in ["oi", "funding", "long_liq", "short_liq", "taker_ratio", "top_ls_ratio", "liq_observed"]:
             ext = f"{c}_ext"
             if ext in out.columns:
                 out[c] = out[ext]
@@ -152,7 +155,7 @@ class RegimeMomentumV5(IStrategy):
         dataframe["vol_sma"] = dataframe["volume"].rolling(96).mean()
         dataframe = self._load_external_features(metadata["pair"], dataframe)
 
-        dataframe["oi_chg"] = dataframe["oi"].pct_change()
+        dataframe["oi_chg"] = dataframe["oi"].pct_change(fill_method=None)
         liq_total = dataframe[["long_liq", "short_liq"]].fillna(0).sum(axis=1)
         liq_mean = liq_total.rolling(96).mean()
         liq_std = liq_total.rolling(96).std().replace(0, np.nan)
@@ -167,8 +170,7 @@ class RegimeMomentumV5(IStrategy):
         dataframe["enter_short"] = 0
         dataframe["enter_tag"] = None
 
-        oi_ok_long = dataframe["oi_chg"].isna() | (dataframe["oi_chg"] >= float(self.oi_confirm.value))
-        oi_ok_short = dataframe["oi_chg"].isna() | (dataframe["oi_chg"] >= float(self.oi_confirm.value))
+        oi_ok = dataframe["oi_chg"].isna() | (dataframe["oi_chg"] >= float(self.oi_confirm.value))
         funding_ok = dataframe["funding"].isna() | (dataframe["funding"].abs() <= float(self.max_abs_funding.value))
 
         normal_long = (
@@ -178,7 +180,7 @@ class RegimeMomentumV5(IStrategy):
             & (dataframe["close_1h"] > dataframe["breakout_high_1h"])
             & (dataframe["volume_1h"] > dataframe["vol_sma_1h"] * float(self.h1_vol_mult.value))
             & (dataframe["high_vol_6h"] == 0)
-            & oi_ok_long
+            & oi_ok
             & funding_ok
             & (dataframe["volume"] > 0)
         )
@@ -190,33 +192,37 @@ class RegimeMomentumV5(IStrategy):
             & (dataframe["close_1h"] < dataframe["breakout_low_1h"])
             & (dataframe["volume_1h"] > dataframe["vol_sma_1h"] * float(self.h1_vol_mult.value))
             & (dataframe["high_vol_6h"] == 0)
-            & oi_ok_short
+            & oi_ok
             & funding_ok
             & (dataframe["volume"] > 0)
         )
 
+        observed = dataframe["liq_observed"].fillna(0) >= 0.5
         live_panic_long = (
-            (dataframe["liq_z"] >= float(self.panic_liq_z.value))
+            observed
+            & (dataframe["liq_z"] >= float(self.panic_liq_z.value))
             & (dataframe["liq_imbalance"] > 0.35)
             & (dataframe["oi_chg"] <= -float(self.panic_oi_drop.value))
             & (dataframe["ret_1"] >= float(self.panic_return.value))
         )
         live_panic_short = (
-            (dataframe["liq_z"] >= float(self.panic_liq_z.value))
+            observed
+            & (dataframe["liq_z"] >= float(self.panic_liq_z.value))
             & (dataframe["liq_imbalance"] < -0.35)
             & (dataframe["oi_chg"] <= -float(self.panic_oi_drop.value))
             & (dataframe["ret_1"] <= -float(self.panic_return.value))
         )
 
+        proxy = ~observed
         proxy_panic_long = (
-            dataframe["long_liq"].isna()
+            proxy
             & (dataframe["oi_chg"] <= -float(self.panic_oi_drop.value))
             & (dataframe["ret_1"] >= float(self.panic_return.value))
             & (dataframe["volume"] > dataframe["vol_sma"] * 2.0)
             & (dataframe["taker_ratio"].isna() | (dataframe["taker_ratio"] > 1.05))
         )
         proxy_panic_short = (
-            dataframe["long_liq"].isna()
+            proxy
             & (dataframe["oi_chg"] <= -float(self.panic_oi_drop.value))
             & (dataframe["ret_1"] <= -float(self.panic_return.value))
             & (dataframe["volume"] > dataframe["vol_sma"] * 2.0)

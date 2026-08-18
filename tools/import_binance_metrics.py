@@ -1,17 +1,12 @@
 """
-Import Binance Futures public metrics CSV/ZIP files into RMV5 features.sqlite.
-
-Expected useful columns include:
-  create_time, symbol, sum_open_interest,
-  sum_taker_long_short_vol_ratio, sum_toptrader_long_short_ratio
-
-Liquidations are not in current public metrics archives; the strategy therefore
-uses an OI/price/flow cascade proxy unless true liquidation history is imported.
+Import already-downloaded Binance Futures public metrics CSV/ZIP files into RMV5 features.sqlite.
+For automatic public-data downloading use backfill_free.py.
 """
 from __future__ import annotations
 import argparse, sqlite3, zipfile
 from pathlib import Path
 import pandas as pd
+
 
 def read_any(path: Path) -> pd.DataFrame:
     if path.suffix == ".zip":
@@ -25,6 +20,7 @@ def read_any(path: Path) -> pd.DataFrame:
         return pd.read_csv(path, compression="gzip")
     return pd.read_csv(path)
 
+
 def to_timestamp(s: pd.Series) -> pd.Series:
     x = pd.to_datetime(s, utc=True, errors="coerce")
     if x.isna().mean() > 0.5:
@@ -34,6 +30,7 @@ def to_timestamp(s: pd.Series) -> pd.Series:
         x = pd.to_datetime(num, unit=unit, utc=True, errors="coerce")
     return x
 
+
 def ensure_db(db: Path):
     db.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db)
@@ -42,17 +39,22 @@ def ensure_db(db: Path):
             bucket_ms INTEGER NOT NULL,
             symbol TEXT NOT NULL,
             oi REAL,
-            funding_rate REAL DEFAULT 0,
-            long_liq_usdt REAL DEFAULT 0,
-            short_liq_usdt REAL DEFAULT 0,
-            taker_ratio REAL DEFAULT 1,
-            top_ls_ratio REAL DEFAULT 1,
+            funding_rate REAL,
+            long_liq_usdt REAL,
+            short_liq_usdt REAL,
+            taker_ratio REAL,
+            top_ls_ratio REAL,
+            liq_observed INTEGER NOT NULL DEFAULT 0,
             updated_ms INTEGER NOT NULL,
             PRIMARY KEY (bucket_ms, symbol)
         )
     """)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(features)")}
+    if "liq_observed" not in cols:
+        con.execute("ALTER TABLE features ADD COLUMN liq_observed INTEGER NOT NULL DEFAULT 0")
     con.commit()
     return con
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -82,6 +84,8 @@ def main():
         if oi_col: aggmap[oi_col] = "last"
         if taker_col: aggmap[taker_col] = "last"
         if top_col: aggmap[top_col] = "last"
+        if not aggmap:
+            continue
         grouped = df.groupby(["symbol", "bucket"], as_index=False).agg(aggmap)
 
         for _, r in grouped.iterrows():
@@ -89,17 +93,17 @@ def main():
             con.execute("""
                 INSERT INTO features
                 (bucket_ms, symbol, oi, funding_rate, long_liq_usdt, short_liq_usdt,
-                 taker_ratio, top_ls_ratio, updated_ms)
-                VALUES (?, ?, ?, 0, 0, 0, ?, ?, ?)
+                 taker_ratio, top_ls_ratio, liq_observed, updated_ms)
+                VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 0, ?)
                 ON CONFLICT(bucket_ms, symbol) DO UPDATE SET
                   oi=COALESCE(excluded.oi, features.oi),
-                  taker_ratio=excluded.taker_ratio,
-                  top_ls_ratio=excluded.top_ls_ratio
+                  taker_ratio=COALESCE(excluded.taker_ratio, features.taker_ratio),
+                  top_ls_ratio=COALESCE(excluded.top_ls_ratio, features.top_ls_ratio)
             """, (
                 b, str(r["symbol"]).upper(),
                 float(r[oi_col]) if oi_col and pd.notna(r[oi_col]) else None,
-                float(r[taker_col]) if taker_col and pd.notna(r[taker_col]) else 1.0,
-                float(r[top_col]) if top_col and pd.notna(r[top_col]) else 1.0,
+                float(r[taker_col]) if taker_col and pd.notna(r[taker_col]) else None,
+                float(r[top_col]) if top_col and pd.notna(r[top_col]) else None,
                 b,
             ))
             rows += 1
@@ -108,6 +112,7 @@ def main():
 
     con.close()
     print("rows:", rows)
+
 
 if __name__ == "__main__":
     main()

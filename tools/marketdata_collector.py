@@ -16,9 +16,11 @@ DB = Path(os.getenv("RMV5_FEATURE_DB", "/freqtrade/user_data/v5/features.sqlite"
 UNIVERSE = Path(os.getenv("RMV5_UNIVERSE_FILE", "/freqtrade/user_data/v5/universe.json"))
 POLL_SECONDS = int(os.getenv("RMV5_OI_POLL_SECONDS", "30"))
 
+
 def bucket_ms(ts_ms: int, minutes: int = 15) -> int:
     size = minutes * 60 * 1000
     return ts_ms - (ts_ms % size)
+
 
 def ensure_db() -> None:
     DB.parent.mkdir(parents=True, exist_ok=True)
@@ -29,18 +31,23 @@ def ensure_db() -> None:
             bucket_ms INTEGER NOT NULL,
             symbol TEXT NOT NULL,
             oi REAL,
-            funding_rate REAL DEFAULT 0,
-            long_liq_usdt REAL DEFAULT 0,
-            short_liq_usdt REAL DEFAULT 0,
-            taker_ratio REAL DEFAULT 1,
-            top_ls_ratio REAL DEFAULT 1,
+            funding_rate REAL,
+            long_liq_usdt REAL,
+            short_liq_usdt REAL,
+            taker_ratio REAL,
+            top_ls_ratio REAL,
+            liq_observed INTEGER NOT NULL DEFAULT 1,
             updated_ms INTEGER NOT NULL,
             PRIMARY KEY (bucket_ms, symbol)
         )
     """)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(features)")}
+    if "liq_observed" not in cols:
+        con.execute("ALTER TABLE features ADD COLUMN liq_observed INTEGER NOT NULL DEFAULT 1")
     con.execute("CREATE INDEX IF NOT EXISTS idx_features_symbol_time ON features(symbol, bucket_ms)")
     con.commit()
     con.close()
+
 
 def load_symbols() -> list[str]:
     env = os.getenv("V5_SYMBOLS", "").strip()
@@ -54,21 +61,30 @@ def load_symbols() -> list[str]:
             return [x.upper() for x in data]
     return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
 
+
 async def get_json(session: aiohttp.ClientSession, path: str, params=None):
     async with session.get(REST + path, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
         r.raise_for_status()
         return await r.json()
 
+
 def blank_row():
     return {
-        "oi": None, "funding_rate": 0.0,
-        "long_liq_usdt": 0.0, "short_liq_usdt": 0.0,
-        "taker_ratio": 1.0, "top_ls_ratio": 1.0,
+        "oi": None,
+        "funding_rate": None,
+        "long_liq_usdt": 0.0,
+        "short_liq_usdt": 0.0,
+        "taker_ratio": None,
+        "top_ls_ratio": None,
+        "liq_observed": 1,
     }
+
 
 async def poll_derivatives(state: Dict[Any, Any], symbols: list[str]) -> None:
     async with aiohttp.ClientSession() as session:
         last_ratio_minute = None
+        last_taker: dict[str, float] = {}
+        last_top: dict[str, float] = {}
         while True:
             now = int(time.time() * 1000)
             try:
@@ -97,6 +113,10 @@ async def poll_derivatives(state: Dict[Any, Any], symbols: list[str]) -> None:
                         row["funding_rate"] = float(pmap[sym].get("lastFundingRate", 0.0))
                     except Exception:
                         pass
+                if sym in last_taker:
+                    row["taker_ratio"] = last_taker[sym]
+                if sym in last_top:
+                    row["top_ls_ratio"] = last_top[sym]
 
             minute = now // 60_000
             if minute % 5 == 0 and minute != last_ratio_minute:
@@ -125,10 +145,13 @@ async def poll_derivatives(state: Dict[Any, Any], symbols: list[str]) -> None:
                     row = state.setdefault((bucket_ms(now), sym), blank_row())
                     if taker is not None:
                         row["taker_ratio"] = taker
+                        last_taker[sym] = taker
                     if top is not None:
                         row["top_ls_ratio"] = top
+                        last_top[sym] = top
 
             await asyncio.sleep(POLL_SECONDS)
+
 
 async def liquidation_stream(state: Dict[Any, Any], symbols: list[str]) -> None:
     symbols_set = set(symbols)
@@ -163,6 +186,7 @@ async def liquidation_stream(state: Dict[Any, Any], symbols: list[str]) -> None:
             print("Liquidation WS error:", e, "reconnecting...", flush=True)
             await asyncio.sleep(3)
 
+
 async def writer(state: Dict[Any, Any]) -> None:
     ensure_db()
     while True:
@@ -177,20 +201,21 @@ async def writer(state: Dict[Any, Any]) -> None:
                     INSERT INTO features
                     (bucket_ms, symbol, oi, funding_rate,
                      long_liq_usdt, short_liq_usdt,
-                     taker_ratio, top_ls_ratio, updated_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     taker_ratio, top_ls_ratio, liq_observed, updated_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                     ON CONFLICT(bucket_ms, symbol) DO UPDATE SET
                       oi=COALESCE(excluded.oi, features.oi),
-                      funding_rate=excluded.funding_rate,
+                      funding_rate=COALESCE(excluded.funding_rate, features.funding_rate),
                       long_liq_usdt=excluded.long_liq_usdt,
                       short_liq_usdt=excluded.short_liq_usdt,
-                      taker_ratio=excluded.taker_ratio,
-                      top_ls_ratio=excluded.top_ls_ratio,
+                      taker_ratio=COALESCE(excluded.taker_ratio, features.taker_ratio),
+                      top_ls_ratio=COALESCE(excluded.top_ls_ratio, features.top_ls_ratio),
+                      liq_observed=1,
                       updated_ms=excluded.updated_ms
                 """, (
-                    b, sym, row.get("oi"), row.get("funding_rate", 0.0),
+                    b, sym, row.get("oi"), row.get("funding_rate"),
                     row.get("long_liq_usdt", 0.0), row.get("short_liq_usdt", 0.0),
-                    row.get("taker_ratio", 1.0), row.get("top_ls_ratio", 1.0), now,
+                    row.get("taker_ratio"), row.get("top_ls_ratio"), now,
                 ))
             con.commit()
         finally:
@@ -201,6 +226,7 @@ async def writer(state: Dict[Any, Any]) -> None:
             if key[0] < cutoff:
                 state.pop(key, None)
 
+
 async def main() -> None:
     symbols = load_symbols()
     print("RMV5 collector symbols:", ",".join(symbols), flush=True)
@@ -210,6 +236,7 @@ async def main() -> None:
         liquidation_stream(state, symbols),
         writer(state),
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

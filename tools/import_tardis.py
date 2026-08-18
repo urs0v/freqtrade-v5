@@ -1,11 +1,12 @@
 """
-Import normalized Tardis derivative_ticker + liquidations CSV(.gz) into
-RMV5 features.sqlite.
+Optional importer for normalized Tardis derivative_ticker + liquidations CSV(.gz).
+The free RMV5 pipeline does not require this file; see backfill_free.py.
 """
 from __future__ import annotations
 import argparse, glob, sqlite3
 from pathlib import Path
 import pandas as pd
+
 
 def ensure_db(db: Path):
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -15,17 +16,22 @@ def ensure_db(db: Path):
             bucket_ms INTEGER NOT NULL,
             symbol TEXT NOT NULL,
             oi REAL,
-            funding_rate REAL DEFAULT 0,
-            long_liq_usdt REAL DEFAULT 0,
-            short_liq_usdt REAL DEFAULT 0,
-            taker_ratio REAL DEFAULT 1,
-            top_ls_ratio REAL DEFAULT 1,
+            funding_rate REAL,
+            long_liq_usdt REAL,
+            short_liq_usdt REAL,
+            taker_ratio REAL,
+            top_ls_ratio REAL,
+            liq_observed INTEGER NOT NULL DEFAULT 0,
             updated_ms INTEGER NOT NULL,
             PRIMARY KEY (bucket_ms, symbol)
         )
     """)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(features)")}
+    if "liq_observed" not in cols:
+        con.execute("ALTER TABLE features ADD COLUMN liq_observed INTEGER NOT NULL DEFAULT 0")
     con.commit()
     return con
+
 
 def expand(patterns):
     out = []
@@ -33,6 +39,7 @@ def expand(patterns):
         m = glob.glob(p)
         out.extend(m or [p])
     return sorted(set(out))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -44,7 +51,8 @@ def main():
 
     for fn in expand(args.derivative_ticker):
         df = pd.read_csv(fn)
-        if df.empty: continue
+        if df.empty:
+            continue
         df["date"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors="coerce"), unit="us", utc=True)
         df["bucket"] = df["date"].dt.floor("15min")
         oi_name = "open_interest" if "open_interest" in df.columns else "openInterest"
@@ -58,15 +66,15 @@ def main():
             con.execute("""
                 INSERT INTO features
                 (bucket_ms, symbol, oi, funding_rate, long_liq_usdt, short_liq_usdt,
-                 taker_ratio, top_ls_ratio, updated_ms)
-                VALUES (?, ?, ?, ?, 0, 0, 1, 1, ?)
+                 taker_ratio, top_ls_ratio, liq_observed, updated_ms)
+                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?)
                 ON CONFLICT(bucket_ms, symbol) DO UPDATE SET
                   oi=COALESCE(excluded.oi, features.oi),
-                  funding_rate=excluded.funding_rate
+                  funding_rate=COALESCE(excluded.funding_rate, features.funding_rate)
             """, (
                 b, str(r["symbol"]).upper(),
                 float(r["open_interest"]) if pd.notna(r["open_interest"]) else None,
-                float(r["funding_rate"]) if pd.notna(r["funding_rate"]) else 0.0,
+                float(r["funding_rate"]) if pd.notna(r["funding_rate"]) else None,
                 b,
             ))
         con.commit()
@@ -74,7 +82,8 @@ def main():
 
     for fn in expand(args.liquidations):
         df = pd.read_csv(fn)
-        if df.empty: continue
+        if df.empty:
+            continue
         df["date"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors="coerce"), unit="us", utc=True)
         df["bucket"] = df["date"].dt.floor("15min")
         df["notional"] = pd.to_numeric(df["price"], errors="coerce") * pd.to_numeric(df["amount"], errors="coerce")
@@ -89,16 +98,18 @@ def main():
             con.execute("""
                 INSERT INTO features
                 (bucket_ms, symbol, oi, funding_rate, long_liq_usdt, short_liq_usdt,
-                 taker_ratio, top_ls_ratio, updated_ms)
-                VALUES (?, ?, NULL, 0, ?, ?, 1, 1, ?)
+                 taker_ratio, top_ls_ratio, liq_observed, updated_ms)
+                VALUES (?, ?, NULL, NULL, ?, ?, NULL, NULL, 1, ?)
                 ON CONFLICT(bucket_ms, symbol) DO UPDATE SET
                   long_liq_usdt=excluded.long_liq_usdt,
-                  short_liq_usdt=excluded.short_liq_usdt
+                  short_liq_usdt=excluded.short_liq_usdt,
+                  liq_observed=1
             """, (b, str(r["symbol"]).upper(), float(r["long_liq"]), float(r["short_liq"]), b))
         con.commit()
         print("liquidations:", fn)
 
     con.close()
+
 
 if __name__ == "__main__":
     main()

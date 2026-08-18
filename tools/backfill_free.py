@@ -60,6 +60,8 @@ def ensure_db(path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(path, timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA cache_size=-131072")
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS features (
@@ -130,7 +132,7 @@ def build_jobs(symbols: list[str], start: date, end: date, cache: Path) -> list[
 
 async def fetch_job(session: aiohttp.ClientSession, sem: asyncio.Semaphore, job: Job, retries: int = 3):
     if job.cache.exists() and job.cache.stat().st_size > 0:
-        return job, "cached", job.cache.read_bytes()
+        return job, "cached", await asyncio.to_thread(job.cache.read_bytes)
     job.cache.parent.mkdir(parents=True, exist_ok=True)
     async with sem:
         for attempt in range(retries):
@@ -145,7 +147,7 @@ async def fetch_job(session: aiohttp.ClientSession, sem: asyncio.Semaphore, job:
                     data = await r.read()
                     if not data.startswith(b"PK"):
                         return job, f"bad-content-{r.status}", None
-                    job.cache.write_bytes(data)
+                    await asyncio.to_thread(job.cache.write_bytes, data)
                     return job, "downloaded", data
             except Exception as e:
                 if attempt + 1 == retries:
@@ -195,15 +197,17 @@ def parse_metrics(job: Job, data: bytes) -> list[tuple]:
     if not agg:
         return []
     grouped = df.groupby(["_symbol", "_bucket"], as_index=False).agg(agg)
-    rows = []
-    for _, r in grouped.iterrows():
-        b = int(r["_bucket"].timestamp() * 1000)
+
+    rows: list[tuple] = []
+    for r in grouped.itertuples(index=False):
+        rd = r._asdict()
+        b = int(pd.Timestamp(rd["_bucket"]).timestamp() * 1000)
         rows.append((
             b,
-            str(r["_symbol"]),
-            float(r[oi]) if oi and pd.notna(r[oi]) else None,
-            float(r[taker]) if taker and pd.notna(r[taker]) else None,
-            float(r[top]) if top and pd.notna(r[top]) else None,
+            str(rd["_symbol"]),
+            float(rd[oi]) if oi and pd.notna(rd.get(oi)) else None,
+            float(rd[taker]) if taker and pd.notna(rd.get(taker)) else None,
+            float(rd[top]) if top and pd.notna(rd.get(top)) else None,
             b,
         ))
     return rows
@@ -217,10 +221,15 @@ def parse_funding(job: Job, data: bytes) -> list[tuple[int, str, float]]:
     rate = col(df, "funding_rate", "last_funding_rate", "fundingRate")
     if t is None or rate is None:
         return []
-    df["_date"] = to_utc_series(df[t])
-    df["_rate"] = pd.to_numeric(df[rate], errors="coerce")
-    df = df.dropna(subset=["_date", "_rate"]).sort_values("_date")
-    return [(int(r["_date"].timestamp() * 1000), job.symbol, float(r["_rate"])) for _, r in df.iterrows()]
+    dates = to_utc_series(df[t])
+    rates = pd.to_numeric(df[rate], errors="coerce")
+    valid = dates.notna() & rates.notna()
+    dates = dates[valid]
+    rates = rates[valid]
+    return [
+        (int(pd.Timestamp(d).timestamp() * 1000), job.symbol, float(r))
+        for d, r in zip(dates, rates)
+    ]
 
 
 def upsert_metrics(con: sqlite3.Connection, rows: list[tuple]) -> None:
@@ -285,42 +294,65 @@ async def main_async(args) -> None:
     print(f"Range: {start} -> {end}")
     print(f"Jobs: metrics={metrics_jobs}, funding={funding_jobs}")
     print("Source: Binance public data archives only")
+    print(f"Downloader: concurrency={args.concurrency}, chunk={args.chunk_size}, threaded parsing=on")
 
     timeout = aiohttp.ClientTimeout(total=60)
-    connector = aiohttp.TCPConnector(limit=args.concurrency)
+    connector = aiohttp.TCPConnector(limit=args.concurrency, ttl_dns_cache=300)
     sem = asyncio.Semaphore(args.concurrency)
     funding_events: dict[str, list[tuple[int, str, float]]] = {s: [] for s in symbols}
     stats = {"downloaded": 0, "cached": 0, "missing": 0, "error": 0, "rows": 0}
+    done_count = 0
+    metrics_buffer: list[tuple] = []
 
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers={"User-Agent": "RMV5-free-backfill/1.0"}) as session:
-        pending = [asyncio.create_task(fetch_job(session, sem, j)) for j in jobs]
-        done_count = 0
-        for fut in asyncio.as_completed(pending):
-            job, status, data = await fut
-            done_count += 1
-            if status in {"downloaded", "cached"}:
-                stats[status] += 1
-            elif status == "missing":
-                stats["missing"] += 1
-            else:
-                stats["error"] += 1
-                if args.verbose:
-                    print(job.url, status)
-            if data:
-                try:
-                    if job.kind == "metrics":
-                        rows = parse_metrics(job, data)
-                        upsert_metrics(con, rows)
-                        stats["rows"] += len(rows)
-                    else:
-                        funding_events[job.symbol].extend(parse_funding(job, data))
-                except Exception as e:
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers={"User-Agent": "RMV5-free-backfill/2.0"}) as session:
+        for chunk_start in range(0, len(jobs), args.chunk_size):
+            chunk = jobs[chunk_start:chunk_start + args.chunk_size]
+            pending = [asyncio.create_task(fetch_job(session, sem, j)) for j in chunk]
+
+            for fut in asyncio.as_completed(pending):
+                job, status, data = await fut
+                done_count += 1
+                if status in {"downloaded", "cached"}:
+                    stats[status] += 1
+                elif status == "missing":
+                    stats["missing"] += 1
+                else:
                     stats["error"] += 1
                     if args.verbose:
-                        print("parse error", job.url, repr(e))
-            if done_count % 250 == 0:
-                con.commit()
-                print(f"Progress {done_count}/{len(jobs)} | rows={stats['rows']} | missing={stats['missing']} | errors={stats['error']}")
+                        print(job.url, status)
+
+                if data:
+                    try:
+                        if job.kind == "metrics":
+                            rows = await asyncio.to_thread(parse_metrics, job, data)
+                            metrics_buffer.extend(rows)
+                            stats["rows"] += len(rows)
+                        else:
+                            events = await asyncio.to_thread(parse_funding, job, data)
+                            funding_events[job.symbol].extend(events)
+                    except Exception as e:
+                        stats["error"] += 1
+                        if args.verbose:
+                            print("parse error", job.url, repr(e))
+
+                if len(metrics_buffer) >= args.flush_rows:
+                    upsert_metrics(con, metrics_buffer)
+                    metrics_buffer.clear()
+
+                if done_count % 250 == 0:
+                    if metrics_buffer:
+                        upsert_metrics(con, metrics_buffer)
+                        metrics_buffer.clear()
+                    con.commit()
+                    print(
+                        f"Progress {done_count}/{len(jobs)} | rows={stats['rows']} | "
+                        f"missing={stats['missing']} | errors={stats['error']} | cached={stats['cached']}"
+                    )
+
+            if metrics_buffer:
+                upsert_metrics(con, metrics_buffer)
+                metrics_buffer.clear()
+            con.commit()
 
     con.commit()
     start_ms = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp() * 1000)
@@ -357,7 +389,9 @@ def main() -> None:
     ap.add_argument("--universe", default=DEFAULT_UNIVERSE)
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--cache", default=DEFAULT_CACHE)
-    ap.add_argument("--concurrency", type=int, default=12)
+    ap.add_argument("--concurrency", type=int, default=24)
+    ap.add_argument("--chunk-size", type=int, default=1000)
+    ap.add_argument("--flush-rows", type=int, default=24000)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     asyncio.run(main_async(args))

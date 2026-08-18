@@ -41,7 +41,8 @@ class AdaptiveTrend20x(IStrategy):
     stoploss = -0.70
     use_custom_stoploss = True
     trailing_stop = False
-    use_exit_signal = False
+    # custom_exit is used for the paper-style H6 trailing / monthly rebalance.
+    use_exit_signal = True
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
 

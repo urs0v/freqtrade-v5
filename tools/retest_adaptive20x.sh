@@ -62,7 +62,8 @@ with open(dst, "w") as f:
     json.dump(cfg, f, indent=2)
 print("AdaptiveTrend universe:", ", ".join(cfg["exchange"].get("pair_whitelist", [])))
 print(f"wallet={wallet} USDT | max_open_trades={max_trades} | timeframe=6h | leverage=20x")
-print("monthly sizing: 70% long leg / selected longs, 30% short leg / selected shorts")
+print("portfolio sizing: 70% long / 30% short TARGET NOTIONAL; collateral divided by leverage")
+print("compounding: target notionals scale automatically with current equity")
 PY
 
 echo "=== 4/4 FULL ADAPTIVETREND 20X BACKTEST ==="

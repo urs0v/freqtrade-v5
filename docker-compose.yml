@@ -1,0 +1,20 @@
+services:
+  rmv5:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      RMV5_FORCE_20X: "true"
+      RMV5_TOP_N: "20"
+      RMV5_FEATURE_DB: "/freqtrade/user_data/v5/features.sqlite"
+      FREQTRADE__API_SERVER__JWT_SECRET_KEY: "CHANGE_THIS"
+      FREQTRADE__API_SERVER__WS_TOKEN: "CHANGE_THIS"
+      FREQTRADE__API_SERVER__USERNAME: "freqtrader"
+      FREQTRADE__API_SERVER__PASSWORD: "CHANGE_THIS"
+    volumes:
+      - rmv5_data:/freqtrade/user_data
+    ports:
+      - "8080:8080"
+
+volumes:
+  rmv5_data:

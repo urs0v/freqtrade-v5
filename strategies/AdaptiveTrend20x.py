@@ -21,11 +21,13 @@ class AdaptiveTrend20x(IStrategy):
       - native 6h momentum signals
       - previous-month parameter optimization / Sharpe selection
       - monthly active universe
-      - 70/30 long-short capital allocation
+      - 70/30 long-short portfolio allocation
       - ATR trailing exit updated on completed H6 candles only
 
     Project modification:
       - every trade uses up to 20x isolated leverage
+      - collateral is divided by leverage so 70/30 remains a NOTIONAL portfolio
+        allocation rather than accidentally becoming ~20x gross portfolio exposure
       - an emergency price-space stop protects against liquidation between H6 closes
     """
 
@@ -158,7 +160,11 @@ class AdaptiveTrend20x(IStrategy):
         side: str,
         **kwargs,
     ) -> float:
-        # Compound automatically: allocations are fractions of CURRENT account equity.
+        # Compound automatically from CURRENT equity.
+        # IMPORTANT: Freqtrade applies leverage AFTER this returned stake amount.
+        # Therefore 70/30 must be defined in target NOTIONAL exposure and collateral
+        # must be divided by leverage. Example: $100 equity, 70% long target and 20x
+        # leverage => only $3.50 total long collateral, producing ~$70 long notional.
         month = self._month_from_tag(entry_tag, current_time)
         block = self._month_block(month)
         count = int(block.get("n_long", 0) if side == "long" else block.get("n_short", 0))
@@ -170,12 +176,12 @@ class AdaptiveTrend20x(IStrategy):
         except Exception:
             equity = float(max_stake)
 
-        leg = 0.70 if side == "long" else 0.30
-        stake = equity * leg / count
-        stake = min(stake, float(max_stake))
-        if min_stake is not None and stake < float(min_stake):
-            return 0.0
-        return float(max(0.0, stake))
+        leg_notional_fraction = 0.70 if side == "long" else 0.30
+        lev = max(float(leverage), 1.0)
+        target_notional = equity * leg_notional_fraction / count
+        stake = target_notional / lev
+        # Let Freqtrade clamp small desired stakes to exchange min_stake where needed.
+        return float(min(max(stake, 0.0), float(max_stake)))
 
     def _last_closed_h6(self, pair: str, current_time: datetime):
         # timeframe-detail may call callbacks every 5m. The paper updates its trailing

@@ -20,7 +20,7 @@ echo "Train: 2022-2024 | validation: 2025 | 2026 diagnostic only"
 echo "DB: $DB"
 echo "Cost: $COST_BPS bps roundtrip"
 
-python /opt/rmv5/tools/research_derivatives_alpha.py \
+python /opt/rmv5/tools/research_derivatives_alpha_fixed.py \
   --config "$CONFIG" \
   --datadir "$DATADIR" \
   --db "$DB" \

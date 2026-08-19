@@ -37,8 +37,10 @@ echo "DB: $DB"
 echo "Range: $START -> $END"
 echo "Symbols: $SYMBOLS"
 echo "Historical metrics are stamped at 15m bucket CLOSE; funding is strictly lagged past its event timestamp."
+echo "Starting downloader (progress prints every 250 jobs)..."
 
-python /opt/rmv5/tools/backfill_derivatives_pti.py \
+# -u keeps progress visible even when stdout is piped through tee/Coolify.
+python -u /opt/rmv5/tools/backfill_derivatives_pti.py \
   --start "$START" \
   --end "$END" \
   --symbols "$SYMBOLS" \

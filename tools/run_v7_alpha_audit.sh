@@ -7,10 +7,27 @@ CONFIG="${RMV7_TEST_CONFIG:-/freqtrade/user_data/v7/config-v7-core-backtest.json
 STRATEGY_PATH="${RMV5_STRATEGY_PATH:-/opt/rmv5/strategies}"
 RESULTS_DIR="${RMV7_RESULTS_DIR:-/freqtrade/user_data/backtest_results}"
 OUTDIR="${RMV7_ALPHA_OUTDIR:-/freqtrade/user_data/v7/alpha_audit}"
+EXISTING_ZIP="${RMV7_ALPHA_EXISTING_ZIP:-}"
 
 if [ ! -f "$CONFIG" ]; then
   echo "Missing $CONFIG. Run retest_v7_core_2026.sh once first."
   exit 2
+fi
+
+mkdir -p "$OUTDIR"
+
+if [ -n "$EXISTING_ZIP" ]; then
+  if [ ! -f "$EXISTING_ZIP" ]; then
+    echo "Missing existing backtest ZIP: $EXISTING_ZIP"
+    exit 4
+  fi
+  echo "=== V7 ALPHA AUDIT: REUSE EXISTING ZIP ==="
+  echo "ZIP: $EXISTING_ZIP"
+  python /opt/rmv5/tools/audit_v7_alpha.py \
+    --signals "$EXISTING_ZIP" \
+    --config "$CONFIG" \
+    --outdir "$OUTDIR"
+  exit $?
 fi
 
 END_EXCLUSIVE="$(python - "$END_INCLUSIVE" <<'PY'
@@ -23,9 +40,7 @@ PY
 START_FT="${START//-/}"
 TIMERANGE="${START_FT}-${END_EXCLUSIVE}"
 
-mkdir -p "$OUTDIR"
-
-BEFORE="$(ls -1t "$RESULTS_DIR"/*_signals.pkl 2>/dev/null | head -1 || true)"
+BEFORE="$(ls -1t "$RESULTS_DIR"/backtest-result-*.zip 2>/dev/null | head -1 || true)"
 
 echo "=== V7 ALPHA AUDIT: EXPORT RAW SIGNALS ==="
 echo "No detail timeframe, no protections, 1x, fee=0. This run is diagnostic only."
@@ -45,14 +60,19 @@ freqtrade backtesting \
   --cache none \
   --export signals
 
-SIGNALS="$(ls -1t "$RESULTS_DIR"/*_signals.pkl 2>/dev/null | head -1 || true)"
-if [ -z "$SIGNALS" ] || [ "$SIGNALS" = "$BEFORE" ]; then
-  echo "No new *_signals.pkl found in $RESULTS_DIR"
+RESULT_ZIP="$(ls -1t "$RESULTS_DIR"/backtest-result-*.zip 2>/dev/null | head -1 || true)"
+if [ -z "$RESULT_ZIP" ] || [ "$RESULT_ZIP" = "$BEFORE" ]; then
+  echo "No new backtest ZIP found in $RESULTS_DIR"
   exit 3
 fi
 
-echo "Signals file: $SIGNALS"
+if ! unzip -l "$RESULT_ZIP" | grep -q '_signals.pkl'; then
+  echo "Backtest ZIP has no *_signals.pkl member: $RESULT_ZIP"
+  exit 5
+fi
+
+echo "Backtest ZIP: $RESULT_ZIP"
 python /opt/rmv5/tools/audit_v7_alpha.py \
-  --signals "$SIGNALS" \
+  --signals "$RESULT_ZIP" \
   --config "$CONFIG" \
   --outdir "$OUTDIR"

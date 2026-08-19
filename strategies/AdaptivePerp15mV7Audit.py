@@ -55,7 +55,9 @@ class AdaptivePerp15mV7Audit(_BaseAdaptivePerp15mV7R1):
         side: str,
         **kwargs,
     ) -> float:
-        stake = min(float(proposed_stake), float(max_stake))
-        if min_stake is not None and stake < float(min_stake):
-            return 0.0
-        return max(stake, 0.0)
+        # Audit runs must not silently reject a valid signal just because the
+        # diagnostic fixed stake is below an exchange-specific minimum notional.
+        stake = float(proposed_stake)
+        if min_stake is not None:
+            stake = max(stake, float(min_stake))
+        return max(0.0, min(stake, float(max_stake)))

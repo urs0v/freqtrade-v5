@@ -12,7 +12,7 @@ echo "=== STRATEGY BUILD: ADAPTIVETREND DOCUMENTED CORE ==="
 echo "Stage 1/3: historical Binance H6 + exact funding, broad archive universe"
 for PASS in 1 2 3; do
   set +e
-  python -u /opt/rmv5/tools/backfill_adaptivetrend_core_data.py \
+  python -u /opt/rmv5/tools/backfill_adaptivetrend_core_data_fast.py \
     --db "$DB" \
     --start "2021-01-01" \
     --end "2024-12-31" \

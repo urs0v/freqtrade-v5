@@ -86,46 +86,28 @@ def evaluate_candidate(
     signal_step: int,
     roundtrip_cost_bps: float,
 ) -> dict:
-    past = close / close.shift(lookback_bars) - 1.0
-    # Cross-sectional market-neutral residual of past move.
-    resid = past.sub(past.median(axis=1), axis=0)
+    """Vectorized cross-sectional long/short evaluation.
 
+    This preserves the old semantics exactly: rank each timestamp cross-section,
+    take the bottom/top quantiles, equal-weight all selected positions, and then
+    average portfolio returns across signal timestamps. The previous version did
+    the same work with tens of thousands of pandas .loc/quantile/concat calls in
+    a Python loop and could take hours.
+    """
+    # Subtracting the cross-sectional median is unnecessary for ranks/quantiles:
+    # adding/subtracting the same scalar from every asset leaves membership unchanged.
+    score = close / close.shift(lookback_bars) - 1.0
     entry = open_.shift(-1)
     exit_ = open_.shift(-(1 + hold_bars))
     fwd = exit_ / entry - 1.0
 
-    idx = resid.index
+    idx = score.index
     mask_time = (idx >= pd.Timestamp(start, tz="UTC")) & (idx < pd.Timestamp(end, tz="UTC"))
-    eligible_idx = idx[mask_time]
+    row_pos = np.flatnonzero(np.asarray(mask_time))
     if signal_step > 1:
-        eligible_idx = eligible_idx[::signal_step]
+        row_pos = row_pos[::signal_step]
 
-    portfolio_returns: list[float] = []
-    n_positions = 0
-
-    for ts in eligible_idx:
-        s = resid.loc[ts].dropna()
-        r = fwd.loc[ts].reindex(s.index).dropna()
-        s = s.reindex(r.index).dropna()
-        if len(s) < 8:
-            continue
-        lo = s.quantile(q)
-        hi = s.quantile(1.0 - q)
-        low_names = s.index[s <= lo]
-        high_names = s.index[s >= hi]
-        if len(low_names) == 0 or len(high_names) == 0:
-            continue
-
-        if mode == "reversal":
-            x = pd.concat([r.reindex(low_names), -r.reindex(high_names)]).dropna()
-        else:
-            x = pd.concat([-r.reindex(low_names), r.reindex(high_names)]).dropna()
-        if x.empty:
-            continue
-        portfolio_returns.append(float(x.mean()))
-        n_positions += int(len(x))
-
-    if not portfolio_returns:
+    if len(row_pos) == 0:
         return {
             "n_signals": 0,
             "n_positions": 0,
@@ -135,11 +117,57 @@ def evaluate_candidate(
             "net_mean_bps": np.nan,
         }
 
-    arr = np.asarray(portfolio_returns, dtype=float)
+    s = score.to_numpy(dtype=np.float64, copy=False)[row_pos]
+    r = fwd.to_numpy(dtype=np.float64, copy=False)[row_pos]
+    valid = np.isfinite(s) & np.isfinite(r)
+
+    # Match old guard: at least 8 assets with both signal and forward return.
+    enough = valid.sum(axis=1) >= 8
+    if not enough.any():
+        return {
+            "n_signals": 0,
+            "n_positions": 0,
+            "gross_mean_bps": np.nan,
+            "gross_median_bps": np.nan,
+            "win_pct": np.nan,
+            "net_mean_bps": np.nan,
+        }
+
+    s = s[enough]
+    r = r[enough]
+    valid = valid[enough]
+
+    masked_s = np.where(valid, s, np.nan)
+    lo = np.nanquantile(masked_s, q, axis=1)
+    hi = np.nanquantile(masked_s, 1.0 - q, axis=1)
+
+    low = valid & (s <= lo[:, None])
+    high = valid & (s >= hi[:, None])
+    counts = low.sum(axis=1) + high.sum(axis=1)
+    usable = counts > 0
+    if not usable.any():
+        return {
+            "n_signals": 0,
+            "n_positions": 0,
+            "gross_mean_bps": np.nan,
+            "gross_median_bps": np.nan,
+            "win_pct": np.nan,
+            "net_mean_bps": np.nan,
+        }
+
+    low_sum = np.where(low, r, 0.0).sum(axis=1)
+    high_sum = np.where(high, r, 0.0).sum(axis=1)
+
+    if mode == "reversal":
+        portfolio = (low_sum - high_sum) / counts
+    else:
+        portfolio = (-low_sum + high_sum) / counts
+
+    arr = portfolio[usable]
     gross_mean_bps = float(arr.mean() * 10000.0)
     return {
         "n_signals": int(len(arr)),
-        "n_positions": int(n_positions),
+        "n_positions": int(counts[usable].sum()),
         "gross_mean_bps": gross_mean_bps,
         "gross_median_bps": float(np.median(arr) * 10000.0),
         "win_pct": float(np.mean(arr > 0) * 100.0),

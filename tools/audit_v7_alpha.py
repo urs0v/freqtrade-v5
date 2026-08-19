@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
+import zipfile
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -39,8 +42,23 @@ def infer_pair(path: tuple[Any, ...], df: pd.DataFrame) -> str | None:
     return None
 
 
+def load_signal_object(source: Path) -> Any:
+    """Load Freqtrade exported signal analysis either from a ZIP or standalone pkl."""
+    if source.suffix.lower() == ".zip":
+        with zipfile.ZipFile(source, "r") as zf:
+            members = [n for n in zf.namelist() if n.endswith("_signals.pkl")]
+            if not members:
+                raise RuntimeError(f"No *_signals.pkl member found inside {source}")
+            if len(members) > 1:
+                print(f"WARN multiple signal members found, using {members[0]}")
+            member = members[0]
+            print(f"Reading signal dump from ZIP member: {member}")
+            return joblib.load(io.BytesIO(zf.read(member)))
+    return joblib.load(source)
+
+
 def extract_signals(signals_file: Path) -> pd.DataFrame:
-    obj = pd.read_pickle(signals_file)
+    obj = load_signal_object(signals_file)
     chunks: list[pd.DataFrame] = []
 
     for path, frame in walk_frames(obj):
@@ -59,7 +77,11 @@ def extract_signals(signals_file: Path) -> pd.DataFrame:
 
         work["date"] = pd.to_datetime(work["date"], utc=True)
         work["pair"] = pair if pair is not None else work.get("pair", "UNKNOWN")
-        work["side"] = np.where(pd.to_numeric(work.get("enter_short", 0), errors="coerce").fillna(0) > 0, "short", "long")
+        work["side"] = np.where(
+            pd.to_numeric(work.get("enter_short", 0), errors="coerce").fillna(0) > 0,
+            "short",
+            "long",
+        )
         work["score"] = np.where(
             work["side"].eq("short"),
             pd.to_numeric(work.get("short_score", np.nan), errors="coerce"),
@@ -68,7 +90,14 @@ def extract_signals(signals_file: Path) -> pd.DataFrame:
         if "enter_tag" not in work.columns:
             work["enter_tag"] = "unknown"
         keep = ["date", "pair", "side", "enter_tag", "score", "close"]
-        for extra in ["long_score", "short_score", "trend_strength", "adx_quality", "vol_stress", "volume_quality"]:
+        for extra in [
+            "long_score",
+            "short_score",
+            "trend_strength",
+            "adx_quality",
+            "vol_stress",
+            "volume_quality",
+        ]:
             if extra in work.columns:
                 keep.append(extra)
         chunks.append(work[keep])
@@ -195,15 +224,26 @@ def summarize(df: pd.DataFrame):
         for side in ["all", "long", "short"]:
             g = group if side == "all" else group[group["side"] == side]
             g = g[["score", "side_return"]].dropna()
-            corr = float(g["score"].corr(g["side_return"], method="spearman")) if len(g) >= 3 else np.nan
-            corr_rows.append({"horizon": horizon, "side": side, "n": len(g), "spearman_score_vs_return": corr})
+            corr = (
+                float(g["score"].corr(g["side_return"], method="spearman"))
+                if len(g) >= 3
+                else np.nan
+            )
+            corr_rows.append(
+                {
+                    "horizon": horizon,
+                    "side": side,
+                    "n": len(g),
+                    "spearman_score_vs_return": corr,
+                }
+            )
     corr = pd.DataFrame(corr_rows)
     return overall, by_side, by_tag, by_score, by_side_score, corr
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Audit V7 score vs forward side-adjusted returns.")
-    ap.add_argument("--signals", required=True, help="Freqtrade *_signals.pkl file")
+    ap.add_argument("--signals", required=True, help="Freqtrade backtest ZIP or standalone *_signals.pkl")
     ap.add_argument("--config", default="/freqtrade/user_data/v7/config-v7-core-backtest.json")
     ap.add_argument("--datadir", default=None)
     ap.add_argument("--outdir", default="/freqtrade/user_data/v7/alpha_audit")

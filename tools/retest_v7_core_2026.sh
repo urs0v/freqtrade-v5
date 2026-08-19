@@ -10,6 +10,13 @@ BASE_CONFIG="${RMV7_BASE_CONFIG:-/opt/rmv5/config-v5.base.json}"
 TEST_CONFIG="${RMV7_TEST_CONFIG:-/freqtrade/user_data/v7/config-v7-core-backtest.json}"
 UNIVERSE_FILE="${RMV7_UNIVERSE_FILE:-/opt/rmv5/tools/historical_universe.json}"
 STRATEGY_PATH="${RMV5_STRATEGY_PATH:-/opt/rmv5/strategies}"
+STRATEGY="${RMV7_STRATEGY:-AdaptivePerp15mV7R1}"
+DETAIL_TIMEFRAME="${RMV7_DETAIL_TIMEFRAME:-5m}"
+
+case "$DETAIL_TIMEFRAME" in
+  1m|5m) ;;
+  *) echo "RMV7_DETAIL_TIMEFRAME must be 1m or 5m"; exit 2 ;;
+esac
 
 WALLET="${RMV7_BACKTEST_WALLET:-100}"
 MAX_TRADES="${RMV7_MAX_OPEN_TRADES:-5}"
@@ -21,9 +28,13 @@ LEVERAGE_MIN="${RMV7_LEVERAGE_MIN:-3}"
 LEVERAGE_MAX="${RMV7_LEVERAGE_MAX:-10}"
 RISK_MIN="${RMV7_RISK_MIN:-0.0075}"
 RISK_MAX="${RMV7_RISK_MAX:-0.0200}"
+MIN_EFFECTIVE_RISK="${RMV7_MIN_EFFECTIVE_RISK:-0.0015}"
 PORTFOLIO_HEAT="${RMV7_PORTFOLIO_HEAT:-0.08}"
 SIDE_HEAT="${RMV7_SIDE_HEAT:-0.05}"
 ATR_STOP_MULT="${RMV7_ATR_STOP_MULT:-1.8}"
+DD_SOFT_START="${RMV7_DD_SOFT_START:-0.08}"
+DD_FULL_AT="${RMV7_DD_FULL_AT:-0.30}"
+DD_RISK_FLOOR="${RMV7_DD_RISK_FLOOR:-0.45}"
 
 END_EXCLUSIVE="$(python - "$END_INCLUSIVE" <<'PY'
 import sys
@@ -90,7 +101,6 @@ order_types["force_exit"] = "market"
 order_types["stoploss"] = "market"
 order_types["stoploss_on_exchange"] = False
 
-# API server is irrelevant for a research backtest and should not pull secrets into output.
 if "api_server" in cfg:
     cfg["api_server"]["enabled"] = False
 
@@ -101,17 +111,15 @@ print(f"Config: {out}")
 print(f"Universe ({len(cfg['exchange'].get('pair_whitelist', []))}): " + ", ".join(cfg['exchange'].get('pair_whitelist', [])))
 PY
 
-echo "=== 2/4 ENSURE 1M / 15M / 1H / 4H FUTURES DATA ==="
-echo "Warmup: $WARMUP_START | research: $START -> $END_INCLUSIVE"
+echo "=== 2/4 ENSURE DETAIL / 15M / 1H / 4H FUTURES DATA ==="
+echo "Warmup: $WARMUP_START | research: $START -> $END_INCLUSIVE | detail=$DETAIL_TIMEFRAME"
 freqtrade download-data \
   --config "$TEST_CONFIG" \
   --trading-mode futures \
-  --timeframes 1m 15m 1h 4h \
+  --timeframes "$DETAIL_TIMEFRAME" 15m 1h 4h \
   --timerange "$DOWNLOAD_RANGE"
 
 echo "=== 3/4 ENSURE 1H FUNDING + MARK DATA ==="
-# Current Freqtrade represents futures funding/mark candles on 1h. If the exchange
-# already supplied them, this simply reuses/extends the local dataset.
 freqtrade download-data \
   --config "$TEST_CONFIG" \
   --trading-mode futures \
@@ -120,10 +128,11 @@ freqtrade download-data \
   --timerange "$DOWNLOAD_RANGE"
 
 echo "=== 4/4 ADAPTIVEPERP15M V7 CORE BACKTEST ==="
-echo "period=$START..$END_INCLUSIVE | wallet=$WALLET | max_open=$MAX_TRADES | fee=$FEE"
+echo "strategy=$STRATEGY | period=$START..$END_INCLUSIVE | wallet=$WALLET | max_open=$MAX_TRADES | fee=$FEE"
 echo "score threshold=$ENTRY_THRESHOLD | gap=$SCORE_GAP"
-echo "leverage=${LEVERAGE_MIN}-${LEVERAGE_MAX}x | risk/trade=${RISK_MIN}-${RISK_MAX} | heat=$PORTFOLIO_HEAT | side_heat=$SIDE_HEAT"
-echo "ATR stop mult=$ATR_STOP_MULT | timeframe=15m | detail=1m"
+echo "leverage=${LEVERAGE_MIN}-${LEVERAGE_MAX}x | risk/trade=${RISK_MIN}-${RISK_MAX} | min_effective_risk=$MIN_EFFECTIVE_RISK"
+echo "heat=$PORTFOLIO_HEAT | side_heat=$SIDE_HEAT | DD governor start=$DD_SOFT_START full=$DD_FULL_AT floor=$DD_RISK_FLOOR"
+echo "ATR stop mult=$ATR_STOP_MULT | timeframe=15m | detail=$DETAIL_TIMEFRAME"
 
 RMV7_ENTRY_THRESHOLD="$ENTRY_THRESHOLD" \
 RMV7_SCORE_GAP="$SCORE_GAP" \
@@ -131,18 +140,22 @@ RMV7_LEVERAGE_MIN="$LEVERAGE_MIN" \
 RMV7_LEVERAGE_MAX="$LEVERAGE_MAX" \
 RMV7_RISK_MIN="$RISK_MIN" \
 RMV7_RISK_MAX="$RISK_MAX" \
+RMV7_MIN_EFFECTIVE_RISK="$MIN_EFFECTIVE_RISK" \
 RMV7_PORTFOLIO_HEAT="$PORTFOLIO_HEAT" \
 RMV7_SIDE_HEAT="$SIDE_HEAT" \
 RMV7_ATR_STOP_MULT="$ATR_STOP_MULT" \
+RMV7_DD_SOFT_START="$DD_SOFT_START" \
+RMV7_DD_FULL_AT="$DD_FULL_AT" \
+RMV7_DD_RISK_FLOOR="$DD_RISK_FLOOR" \
 RMV7_ENABLE_PROTECTIONS="${RMV7_ENABLE_PROTECTIONS:-true}" \
 RMV7_ENABLE_TIME_EXIT="${RMV7_ENABLE_TIME_EXIT:-true}" \
 freqtrade backtesting \
   --config "$TEST_CONFIG" \
-  --strategy AdaptivePerp15mV7 \
+  --strategy "$STRATEGY" \
   --strategy-path "$STRATEGY_PATH" \
   --timerange "$TIMERANGE" \
   --timeframe 15m \
-  --timeframe-detail 1m \
+  --timeframe-detail "$DETAIL_TIMEFRAME" \
   --fee "$FEE" \
   --enable-protections \
   --cache none \

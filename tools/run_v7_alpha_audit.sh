@@ -39,7 +39,7 @@ freqtrade backtesting \
   --timerange "$TIMERANGE" \
   --timeframe 15m \
   --max-open-trades 20 \
-  --stake-amount 1 \
+  --stake-amount 20 \
   --dry-run-wallet 1000 \
   --fee 0 \
   --cache none \

@@ -2,17 +2,15 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import math
-import zipfile
 from pathlib import Path
 from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
 
+from freqtrade.data.btanalysis import load_backtest_analysis_data, load_backtest_data
 from freqtrade.data.history import load_pair_history
 from freqtrade.enums import CandleType
 
@@ -20,90 +18,101 @@ from freqtrade.enums import CandleType
 HORIZONS = {"1h": 4, "4h": 16, "8h": 32, "12h": 48}
 SCORE_BINS = [-np.inf, 0.64, 0.68, 0.72, 0.76, 0.80, 0.85, np.inf]
 SCORE_LABELS = ["<.64", ".64-.68", ".68-.72", ".72-.76", ".76-.80", ".80-.85", ">=.85"]
+KEEP_EXTRA = [
+    "long_score",
+    "short_score",
+    "trend_strength",
+    "adx_quality",
+    "vol_stress",
+    "volume_quality",
+]
 
 
-def walk_frames(obj: Any, path: tuple[Any, ...] = ()):
-    if isinstance(obj, pd.DataFrame):
-        yield path, obj
-    elif isinstance(obj, dict):
-        for key, value in obj.items():
-            yield from walk_frames(value, path + (key,))
-    elif isinstance(obj, (list, tuple)):
-        for i, value in enumerate(obj):
-            yield from walk_frames(value, path + (i,))
+def _pick_strategy(signal_obj: dict[str, Any]) -> str:
+    if not signal_obj:
+        raise RuntimeError("Signal export is empty.")
+    if len(signal_obj) == 1:
+        return next(iter(signal_obj))
+    for name in signal_obj:
+        if "AdaptivePerp15mV7Audit" in name:
+            return name
+    raise RuntimeError(f"Multiple strategies in signal export: {list(signal_obj)}")
 
 
-def infer_pair(path: tuple[Any, ...], df: pd.DataFrame) -> str | None:
-    if "pair" in df.columns and not df["pair"].dropna().empty:
-        return str(df["pair"].dropna().iloc[0])
-    for item in reversed(path):
-        if isinstance(item, str) and "/" in item and (":USDT" in item or "USDT" in item):
-            return item
-    return None
+def extract_signals(backtest_zip: Path) -> pd.DataFrame:
+    """Merge Freqtrade's exported signal candles with trade metadata.
 
+    Freqtrade's *_signals.pkl contains strategy -> pair -> DataFrame of the
+    indicator candle preceding each trade. It does not need to contain
+    enter_long/enter_short. Side and enter_tag are therefore taken from the
+    trade records in the same backtest ZIP, matching Freqtrade's own
+    backtesting-analysis semantics (last signal candle strictly before open).
+    """
+    if backtest_zip.suffix.lower() != ".zip":
+        raise RuntimeError("Alpha audit now expects the complete backtest .zip file.")
 
-def load_signal_object(source: Path) -> Any:
-    """Load Freqtrade exported signal analysis either from a ZIP or standalone pkl."""
-    if source.suffix.lower() == ".zip":
-        with zipfile.ZipFile(source, "r") as zf:
-            members = [n for n in zf.namelist() if n.endswith("_signals.pkl")]
-            if not members:
-                raise RuntimeError(f"No *_signals.pkl member found inside {source}")
-            if len(members) > 1:
-                print(f"WARN multiple signal members found, using {members[0]}")
-            member = members[0]
-            print(f"Reading signal dump from ZIP member: {member}")
-            return joblib.load(io.BytesIO(zf.read(member)))
-    return joblib.load(source)
+    signal_obj = load_backtest_analysis_data(backtest_zip, "signals")
+    strategy_name = _pick_strategy(signal_obj)
+    trades = load_backtest_data(backtest_zip, strategy_name)
+    if trades.empty:
+        raise RuntimeError("Backtest ZIP contains no trades.")
 
-
-def extract_signals(signals_file: Path) -> pd.DataFrame:
-    obj = load_signal_object(signals_file)
+    trades = trades.copy()
+    trades["open_date"] = pd.to_datetime(trades["open_date"], utc=True)
     chunks: list[pd.DataFrame] = []
 
-    for path, frame in walk_frames(obj):
-        if frame.empty or "date" not in frame.columns:
-            continue
-        if "enter_long" not in frame.columns and "enter_short" not in frame.columns:
+    pair_frames = signal_obj.get(strategy_name, {})
+    print(f"Signal strategy: {strategy_name} | trade rows: {len(trades)} | pairs: {len(pair_frames)}")
+
+    for pair, frame in pair_frames.items():
+        if frame is None or frame.empty or "date" not in frame.columns:
             continue
 
-        pair = infer_pair(path, frame)
-        work = frame.copy()
-        long_col = pd.to_numeric(work.get("enter_long", 0), errors="coerce").fillna(0)
-        short_col = pd.to_numeric(work.get("enter_short", 0), errors="coerce").fillna(0)
-        work = work[(long_col > 0) | (short_col > 0)].copy()
-        if work.empty:
+        pair_trades = trades.loc[trades["pair"] == pair].copy()
+        if pair_trades.empty:
             continue
 
-        work["date"] = pd.to_datetime(work["date"], utc=True)
-        work["pair"] = pair if pair is not None else work.get("pair", "UNKNOWN")
-        work["side"] = np.where(
-            pd.to_numeric(work.get("enter_short", 0), errors="coerce").fillna(0) > 0,
-            "short",
-            "long",
+        sig = frame.copy()
+        sig["date"] = pd.to_datetime(sig["date"], utc=True)
+        sig = sig.sort_values("date")
+        pair_trades = pair_trades.sort_values("open_date")
+
+        # Same rule Freqtrade uses in backtesting-analysis: attach the last
+        # signal candle strictly before the trade's open_date.
+        merged = pd.merge_asof(
+            pair_trades,
+            sig,
+            left_on="open_date",
+            right_on="date",
+            direction="backward",
+            allow_exact_matches=False,
+            suffixes=("", "_signal"),
         )
-        work["score"] = np.where(
-            work["side"].eq("short"),
-            pd.to_numeric(work.get("short_score", np.nan), errors="coerce"),
-            pd.to_numeric(work.get("long_score", np.nan), errors="coerce"),
+        merged = merged.dropna(subset=["date"])
+        if merged.empty:
+            continue
+
+        missing = [c for c in ("long_score", "short_score", "close") if c not in merged.columns]
+        if missing:
+            raise RuntimeError(
+                f"Signal export for {pair} is missing {missing}. "
+                f"Available indicator columns include: {list(sig.columns)[:80]}"
+            )
+
+        merged["side"] = np.where(merged["is_short"].fillna(False), "short", "long")
+        merged["score"] = np.where(
+            merged["side"].eq("short"),
+            pd.to_numeric(merged["short_score"], errors="coerce"),
+            pd.to_numeric(merged["long_score"], errors="coerce"),
         )
-        if "enter_tag" not in work.columns:
-            work["enter_tag"] = "unknown"
+        merged["enter_tag"] = merged["enter_tag"].fillna("unknown")
+
         keep = ["date", "pair", "side", "enter_tag", "score", "close"]
-        for extra in [
-            "long_score",
-            "short_score",
-            "trend_strength",
-            "adx_quality",
-            "vol_stress",
-            "volume_quality",
-        ]:
-            if extra in work.columns:
-                keep.append(extra)
-        chunks.append(work[keep])
+        keep.extend([c for c in KEEP_EXTRA if c in merged.columns])
+        chunks.append(merged[keep])
 
     if not chunks:
-        raise RuntimeError(f"No entry-signal DataFrames found in {signals_file}")
+        raise RuntimeError("Could not merge any signal candles with trades from the ZIP.")
 
     out = pd.concat(chunks, ignore_index=True)
     out = out.dropna(subset=["date", "pair", "score", "close"])
@@ -159,8 +168,7 @@ def add_forward_returns(signals: pd.DataFrame, config: dict, datadir: Path) -> p
                 if not np.isfinite(future_close):
                     continue
 
-                price_ret = future_close / entry - 1.0
-                side_ret = direction * price_ret
+                side_ret = direction * (future_close / entry - 1.0)
                 window = hist.iloc[pos + 1 : end + 1]
                 if window.empty:
                     continue
@@ -193,7 +201,6 @@ def add_forward_returns(signals: pd.DataFrame, config: dict, datadir: Path) -> p
 def summarize(df: pd.DataFrame):
     df = df.copy()
     df["score_bin"] = pd.cut(df["score"], SCORE_BINS, labels=SCORE_LABELS, right=False)
-    df["win"] = df["side_return"] > 0
 
     def agg(g: pd.DataFrame) -> pd.Series:
         x = g["side_return"].dropna()
@@ -213,7 +220,7 @@ def summarize(df: pd.DataFrame):
             }
         )
 
-    overall = df.groupby(["horizon"], observed=True).apply(agg, include_groups=False).reset_index()
+    overall = df.groupby("horizon", observed=True).apply(agg, include_groups=False).reset_index()
     by_side = df.groupby(["horizon", "side"], observed=True).apply(agg, include_groups=False).reset_index()
     by_tag = df.groupby(["horizon", "enter_tag"], observed=True).apply(agg, include_groups=False).reset_index()
     by_score = df.groupby(["horizon", "score_bin"], observed=True).apply(agg, include_groups=False).reset_index()
@@ -224,26 +231,16 @@ def summarize(df: pd.DataFrame):
         for side in ["all", "long", "short"]:
             g = group if side == "all" else group[group["side"] == side]
             g = g[["score", "side_return"]].dropna()
-            corr = (
-                float(g["score"].corr(g["side_return"], method="spearman"))
-                if len(g) >= 3
-                else np.nan
-            )
+            corr = float(g["score"].corr(g["side_return"], method="spearman")) if len(g) >= 3 else np.nan
             corr_rows.append(
-                {
-                    "horizon": horizon,
-                    "side": side,
-                    "n": len(g),
-                    "spearman_score_vs_return": corr,
-                }
+                {"horizon": horizon, "side": side, "n": len(g), "spearman_score_vs_return": corr}
             )
-    corr = pd.DataFrame(corr_rows)
-    return overall, by_side, by_tag, by_score, by_side_score, corr
+    return overall, by_side, by_tag, by_score, by_side_score, pd.DataFrame(corr_rows)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Audit V7 score vs forward side-adjusted returns.")
-    ap.add_argument("--signals", required=True, help="Freqtrade backtest ZIP or standalone *_signals.pkl")
+    ap.add_argument("--signals", required=True, help="Complete Freqtrade backtest ZIP")
     ap.add_argument("--config", default="/freqtrade/user_data/v7/config-v7-core-backtest.json")
     ap.add_argument("--datadir", default=None)
     ap.add_argument("--outdir", default="/freqtrade/user_data/v7/alpha_audit")

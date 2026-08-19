@@ -5,6 +5,7 @@ START="${1:-2026-01-01}"
 END_INCLUSIVE="${2:-2026-08-18}"
 CONFIG="${RMV7_TEST_CONFIG:-/freqtrade/user_data/v7/config-v7-core-backtest.json}"
 STRATEGY_PATH="${RMV5_STRATEGY_PATH:-/opt/rmv5/strategies}"
+STRATEGY="${RMV7_STRATEGY:-AdaptivePerp15mV7R1}"
 
 if [ ! -f "$CONFIG" ]; then
   echo "Missing $CONFIG"
@@ -24,7 +25,7 @@ TIMERANGE="${START_FT}-${END_EXCLUSIVE}"
 
 freqtrade lookahead-analysis \
   --config "$CONFIG" \
-  --strategy AdaptivePerp15mV7 \
+  --strategy "$STRATEGY" \
   --strategy-path "$STRATEGY_PATH" \
   --timerange "$TIMERANGE" \
   --timeframe 15m

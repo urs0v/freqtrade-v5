@@ -21,10 +21,11 @@ PY
 START_FT="${START//-/}"
 TIMERANGE="${START_FT}-${END_EXCLUSIVE}"
 
-# This is deliberately NOT a realistic deployment backtest.
-# It isolates signal/exit quality from leverage, fees, DD sizing and protections.
+# Deliberately not a realistic deployment backtest.
+# This isolates signal/exit quality from leverage, fees, DD sizing, protections
+# and most portfolio-slot competition.
 echo "=== V7 GROSS-EDGE DIAGNOSTIC ==="
-echo "1x leverage | fixed 10 USDT stake | fee=0 | no protections | no detail timeframe"
+echo "1x leverage | fixed 20 USDT stake | fee=0 | no protections | no detail timeframe"
 
 RMV7_ENABLE_PROTECTIONS=false \
 RMV7_ENABLE_TIME_EXIT=true \
@@ -34,9 +35,9 @@ freqtrade backtesting \
   --strategy-path "$STRATEGY_PATH" \
   --timerange "$TIMERANGE" \
   --timeframe 15m \
-  --max-open-trades 5 \
-  --stake-amount 10 \
-  --dry-run-wallet 100 \
+  --max-open-trades 20 \
+  --stake-amount 20 \
+  --dry-run-wallet 1000 \
   --fee 0 \
   --cache none \
   --export trades \

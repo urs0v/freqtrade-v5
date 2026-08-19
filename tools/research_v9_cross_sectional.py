@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -34,16 +35,27 @@ def load_pair(config: dict, datadir: Path, pair: str) -> pd.DataFrame:
 
 def build_panel(config: dict, datadir: Path, pairs: list[str]) -> pd.DataFrame:
     frames = []
-    for pair in pairs:
+    total = len(pairs)
+    print(f"[1/3] Loading 15m data for {total} pairs...", flush=True)
+    for i, pair in enumerate(pairs, 1):
+        t0 = time.monotonic()
         df = load_pair(config, datadir, pair)
         if df.empty:
+            print(f"  [{i:02d}/{total}] {pair}: NO DATA", flush=True)
             continue
         df = df[["date", "open", "close"]].copy().sort_values("date")
         df["date"] = as_ns(df["date"])
         df["pair"] = pair
         frames.append(df)
+        elapsed = time.monotonic() - t0
+        print(
+            f"  [{i:02d}/{total}] {pair}: {len(df):,} candles "
+            f"({df['date'].min().date()} -> {df['date'].max().date()}) [{elapsed:.1f}s]",
+            flush=True,
+        )
     if not frames:
         raise RuntimeError("No futures 15m data loaded.")
+    print("[1/3] Data loading complete. Building cross-sectional panel...", flush=True)
     long = pd.concat(frames, ignore_index=True)
     return long.sort_values(["date", "pair"]).reset_index(drop=True)
 
@@ -52,7 +64,14 @@ def make_wide(panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     close = panel.pivot(index="date", columns="pair", values="close").sort_index()
     open_ = panel.pivot(index="date", columns="pair", values="open").sort_index()
     common = close.index.intersection(open_.index)
-    return close.loc[common], open_.loc[common]
+    close = close.loc[common]
+    open_ = open_.loc[common]
+    print(
+        f"[2/3] Panel ready: {len(common):,} timestamps x {close.shape[1]} pairs. "
+        f"Range {common.min()} -> {common.max()}",
+        flush=True,
+    )
+    return close, open_
 
 
 def evaluate_candidate(
@@ -144,6 +163,7 @@ def main() -> int:
     ap.add_argument("--roundtrip-cost-bps", type=float, default=8.0)
     args = ap.parse_args()
 
+    started = time.monotonic()
     config = json.loads(Path(args.config).read_text())
     pairs = list(config.get("exchange", {}).get("pair_whitelist", []))
     if not pairs:
@@ -153,20 +173,53 @@ def main() -> int:
     close, open_ = make_wide(panel)
 
     rows = []
+    total_candidates = len(LOOKBACKS) * len(HOLDS) * len(MODES)
+    candidate_no = 0
+    print(f"[3/3] Evaluating {total_candidates} candidates (train + 2025 validation)...", flush=True)
+
     for lb_name, lb in LOOKBACKS.items():
         for hold_name, hold in HOLDS.items():
             for mode in MODES:
+                candidate_no += 1
                 base = {"lookback": lb_name, "hold": hold_name, "mode": mode}
-                tr = evaluate_candidate(close, open_, args.train_start, args.train_end, lb, hold, mode, args.quantile, args.signal_step, args.roundtrip_cost_bps)
-                va = evaluate_candidate(close, open_, args.val_start, args.val_end, lb, hold, mode, args.quantile, args.signal_step, args.roundtrip_cost_bps)
-                rows.append({**base, **{f"train_{k}": v for k, v in tr.items()}, **{f"val_{k}": v for k, v in va.items()}})
+                t0 = time.monotonic()
+                print(
+                    f"  [{candidate_no:02d}/{total_candidates}] lookback={lb_name}, hold={hold_name}, mode={mode} ...",
+                    end=" ",
+                    flush=True,
+                )
+                tr = evaluate_candidate(
+                    close, open_, args.train_start, args.train_end, lb, hold, mode,
+                    args.quantile, args.signal_step, args.roundtrip_cost_bps,
+                )
+                va = evaluate_candidate(
+                    close, open_, args.val_start, args.val_end, lb, hold, mode,
+                    args.quantile, args.signal_step, args.roundtrip_cost_bps,
+                )
+                elapsed = time.monotonic() - t0
+                print(
+                    f"train={tr['net_mean_bps']:+.2f} bps | val={va['net_mean_bps']:+.2f} bps "
+                    f"| {elapsed:.1f}s",
+                    flush=True,
+                )
+                rows.append({
+                    **base,
+                    **{f"train_{k}": v for k, v in tr.items()},
+                    **{f"val_{k}": v for k, v in va.items()},
+                })
 
     grid = pd.DataFrame(rows)
     grid["robust_pre2026"] = (grid["train_net_mean_bps"] > 0) & (grid["val_net_mean_bps"] > 0)
-    grid = grid.sort_values(["robust_pre2026", "val_net_mean_bps", "train_net_mean_bps"], ascending=[False, False, False])
+    grid = grid.sort_values(
+        ["robust_pre2026", "val_net_mean_bps", "train_net_mean_bps"],
+        ascending=[False, False, False],
+    )
 
-    print("=== V9 CROSS-SECTIONAL PRE-2026 GRID ===")
-    show_cols = ["lookback", "hold", "mode", "train_net_mean_bps", "val_net_mean_bps", "val_win_pct", "robust_pre2026"]
+    print("\n=== V9 CROSS-SECTIONAL PRE-2026 GRID ===")
+    show_cols = [
+        "lookback", "hold", "mode", "train_net_mean_bps",
+        "val_net_mean_bps", "val_win_pct", "robust_pre2026",
+    ]
     print(grid[show_cols].to_string(index=False))
 
     robust = grid[grid["robust_pre2026"]]
@@ -181,7 +234,11 @@ def main() -> int:
     lb = LOOKBACKS[str(selected["lookback"])]
     hold = HOLDS[str(selected["hold"])]
     mode = str(selected["mode"])
-    te = evaluate_candidate(close, open_, args.test_start, args.test_end, lb, hold, mode, args.quantile, args.signal_step, args.roundtrip_cost_bps)
+    print("\nEvaluating selected candidate on 2026 diagnostic...", flush=True)
+    te = evaluate_candidate(
+        close, open_, args.test_start, args.test_end, lb, hold, mode,
+        args.quantile, args.signal_step, args.roundtrip_cost_bps,
+    )
     print("\n=== 2026 DIAGNOSTIC FOR PRE-2026 SELECTED CANDIDATE ===")
     print(pd.Series({"lookback": selected["lookback"], "hold": selected["hold"], "mode": mode, **te}).to_string())
     print("NOTE: 2026 has already been inspected in prior experiments, so treat this as diagnostic, not pristine OOS.")
@@ -189,8 +246,11 @@ def main() -> int:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     grid.to_csv(outdir / "grid_pre2026.csv", index=False)
-    pd.DataFrame([{**{"lookback": selected["lookback"], "hold": selected["hold"], "mode": mode}, **te}]).to_csv(outdir / "selected_2026.csv", index=False)
+    pd.DataFrame([
+        {**{"lookback": selected["lookback"], "hold": selected["hold"], "mode": mode}, **te}
+    ]).to_csv(outdir / "selected_2026.csv", index=False)
     print(f"\nOutput: {outdir}")
+    print(f"Total runtime: {time.monotonic() - started:.1f}s", flush=True)
     return 0
 
 

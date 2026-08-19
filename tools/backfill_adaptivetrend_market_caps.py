@@ -2,20 +2,19 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
 import requests
 
 DEFAULT_DB = "/freqtrade/user_data/strategy_build/adaptivetrend/core.sqlite"
 PUBLIC_BASE = "https://api.coingecko.com/api/v3"
 DEMO_BASE = "https://api.coingecko.com/api/v3"
 PRO_BASE = "https://pro-api.coingecko.com/api/v3"
+MIN_USABLE_CAP_SYMBOLS = 75
 
 OVERRIDES = {
     "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "XRP": "ripple", "SOL": "solana",
@@ -67,7 +66,6 @@ def ensure_schema(con: sqlite3.Connection) -> None:
 
 def norm_base(symbol: str) -> str:
     base = symbol[:-4] if symbol.endswith("USDT") else symbol
-    # Binance multiplier contracts, e.g. 1000SHIBUSDT, reference the underlying token.
     for p in ("1000000", "10000", "1000"):
         if base.startswith(p) and len(base) > len(p):
             base = base[len(p):]
@@ -77,7 +75,7 @@ def norm_base(symbol: str) -> str:
 
 def get_json(session: requests.Session, url: str, params: dict, headers: dict, retries: int = 8) -> dict | list:
     delay = 3.0
-    for attempt in range(retries):
+    for _ in range(retries):
         r = session.get(url, params=params, headers=headers, timeout=60)
         if r.status_code == 429:
             retry = float(r.headers.get("Retry-After", delay))
@@ -94,8 +92,6 @@ def get_json(session: requests.Session, url: str, params: dict, headers: dict, r
 
 
 def build_mapping(session: requests.Session, api_base: str, headers: dict, symbols: list[str]) -> tuple[dict[str, str], dict[str, str]]:
-    # Rank symbol collisions by current market cap. This is used only to resolve CoinGecko IDs,
-    # never as a historical portfolio feature.
     ranked: dict[str, tuple[str, float]] = {}
     for page in range(1, 13):
         data = get_json(
@@ -198,10 +194,12 @@ def main() -> int:
     for i, symbol in enumerate(todo, 1):
         cid = mapping[symbol]
         try:
+            # Do not force interval=daily in public/keyless mode. A >90-day range is automatically daily,
+            # and omitting the interval avoids plan-specific restrictions.
             data = get_json(
                 session,
                 f"{api_base}/coins/{cid}/market_chart/range",
-                {"vs_currency": "usd", "from": args.start, "to": args.end, "interval": "daily"},
+                {"vs_currency": "usd", "from": args.start, "to": args.end},
                 headers,
             )
             caps = data.get("market_caps", []) if isinstance(data, dict) else []
@@ -234,7 +232,9 @@ def main() -> int:
     print("\n=== MARKET CAP DATA DONE ===")
     print(f"mapped_ids={len(mapping)} | cap_symbols={cap_symbols} | cap_rows={cap_rows:,} | fetch_failures={failures}")
     print(f"DB: {db}")
-    return 0 if failures == 0 else 2
+    # Individual old/delisted IDs can legitimately have no CoinGecko history. The backtester
+    # enforces a stricter per-month universe-size requirement, so partial mapping is acceptable here.
+    return 0 if cap_symbols >= MIN_USABLE_CAP_SYMBOLS else 2
 
 
 if __name__ == "__main__":

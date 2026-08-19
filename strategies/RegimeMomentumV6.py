@@ -21,9 +21,12 @@ class RegimeMomentumV6(IStrategy):
       - ATR/volatility-based account-risk sizing
       - entry-anchored initial stop with profit locking / trailing
 
-    This intentionally does not use the derivatives feature DB yet. The goal of the
-    first V6 test is to establish whether the faster price-only core has edge before
-    reintroducing OI/funding/liquidation filters.
+    Environment switches are intentionally available for clean ablation tests:
+      RMV6_ENABLE_BREAKOUT=true/false
+      RMV6_ENABLE_RECLAIM=true/false
+      RMV6_ENABLE_LONG=true/false
+      RMV6_ENABLE_SHORT=true/false
+      RMV6_ENABLE_REGIME_EXIT=true/false
     """
 
     INTERFACE_VERSION = 3
@@ -42,6 +45,13 @@ class RegimeMomentumV6(IStrategy):
 
     position_adjustment_enable = False
     max_entry_position_adjustment = 0
+
+    @staticmethod
+    def _flag(name: str, default: bool = True) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.lower() in {"1", "true", "yes", "on"}
 
     @informative("4h")
     def populate_indicators_4h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -140,16 +150,29 @@ class RegimeMomentumV6(IStrategy):
             & liquid
         )
 
-        dataframe.loc[breakout_long, ["enter_long", "enter_tag"]] = (1, "v6_breakout_long")
-        dataframe.loc[breakout_short, ["enter_short", "enter_tag"]] = (1, "v6_breakout_short")
-        dataframe.loc[reclaim_long & ~breakout_long, ["enter_long", "enter_tag"]] = (1, "v6_reclaim_long")
-        dataframe.loc[reclaim_short & ~breakout_short, ["enter_short", "enter_tag"]] = (1, "v6_reclaim_short")
+        use_breakout = self._flag("RMV6_ENABLE_BREAKOUT", True)
+        use_reclaim = self._flag("RMV6_ENABLE_RECLAIM", True)
+        use_long = self._flag("RMV6_ENABLE_LONG", True)
+        use_short = self._flag("RMV6_ENABLE_SHORT", True)
+
+        active_breakout_long = breakout_long if (use_breakout and use_long) else (breakout_long & False)
+        active_breakout_short = breakout_short if (use_breakout and use_short) else (breakout_short & False)
+        active_reclaim_long = reclaim_long if (use_reclaim and use_long) else (reclaim_long & False)
+        active_reclaim_short = reclaim_short if (use_reclaim and use_short) else (reclaim_short & False)
+
+        dataframe.loc[active_breakout_long, ["enter_long", "enter_tag"]] = (1, "v6_breakout_long")
+        dataframe.loc[active_breakout_short, ["enter_short", "enter_tag"]] = (1, "v6_breakout_short")
+        dataframe.loc[active_reclaim_long & ~active_breakout_long, ["enter_long", "enter_tag"]] = (1, "v6_reclaim_long")
+        dataframe.loc[active_reclaim_short & ~active_breakout_short, ["enter_short", "enter_tag"]] = (1, "v6_reclaim_short")
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["exit_long"] = 0
         dataframe["exit_short"] = 0
         dataframe["exit_tag"] = None
+
+        if not self._flag("RMV6_ENABLE_REGIME_EXIT", True):
+            return dataframe
 
         long_invalid = (
             (dataframe["ema12"] < dataframe["ema36"])
@@ -217,8 +240,6 @@ class RegimeMomentumV6(IStrategy):
         stop_pct = self._initial_price_stop_pct(pair, current_rate)
         lev = max(float(leverage), 1.0)
 
-        # Approximate account loss at initial stop:
-        # collateral * leverage * adverse_price_move ~= equity * risk_fraction.
         stake = equity * risk_fraction / max(stop_pct * lev, 1e-9)
         stake = min(stake, equity * collateral_cap, float(max_stake))
         return float(max(stake, 0.0))
@@ -246,8 +267,6 @@ class RegimeMomentumV6(IStrategy):
 
         atr_pct = self._current_atr_pct(pair, current_rate)
 
-        # current_profit is leverage-aware in futures mode. Lock profit early enough to
-        # avoid turning every fast 1h move into another large leveraged stop.
         if current_profit >= 0.12:
             if trade.is_short:
                 absolute_stop = min(absolute_stop, trade.open_rate * 0.999)

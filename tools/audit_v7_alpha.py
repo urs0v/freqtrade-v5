@@ -28,6 +28,11 @@ KEEP_EXTRA = [
 ]
 
 
+def _utc_ns(values: pd.Series) -> pd.Series:
+    """Normalize tz-aware timestamps to one exact pandas resolution for joins/lookups."""
+    return pd.to_datetime(values, utc=True).dt.as_unit("ns")
+
+
 def _pick_strategy(signal_obj: dict[str, Any]) -> str:
     if not signal_obj:
         raise RuntimeError("Signal export is empty.")
@@ -58,7 +63,7 @@ def extract_signals(backtest_zip: Path) -> pd.DataFrame:
         raise RuntimeError("Backtest ZIP contains no trades.")
 
     trades = trades.copy()
-    trades["open_date"] = pd.to_datetime(trades["open_date"], utc=True)
+    trades["open_date"] = _utc_ns(trades["open_date"])
     chunks: list[pd.DataFrame] = []
 
     pair_frames = signal_obj.get(strategy_name, {})
@@ -73,7 +78,7 @@ def extract_signals(backtest_zip: Path) -> pd.DataFrame:
             continue
 
         sig = frame.copy()
-        sig["date"] = pd.to_datetime(sig["date"], utc=True)
+        sig["date"] = _utc_ns(sig["date"])
         sig = sig.sort_values("date")
         pair_trades = pair_trades.sort_values("open_date")
 
@@ -148,7 +153,7 @@ def add_forward_returns(signals: pd.DataFrame, config: dict, datadir: Path) -> p
             continue
 
         hist = hist.sort_values("date").reset_index(drop=True)
-        hist["date"] = pd.to_datetime(hist["date"], utc=True)
+        hist["date"] = _utc_ns(hist["date"])
         pos_by_date = {ts: i for i, ts in enumerate(hist["date"])}
 
         for _, sig in sigs.iterrows():

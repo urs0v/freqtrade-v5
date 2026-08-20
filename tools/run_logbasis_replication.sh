@@ -21,7 +21,7 @@ echo "Costs: 7bps per changed side; 10bps stress"
 echo "No parameter search. Backfill is resumable."
 echo
 
-python /opt/rmv5/tools/backfill_logbasis_8h.py \
+python /opt/rmv5/tools/backfill_logbasis_8h_v2.py \
   --core "$CORE" \
   --db "$DB" \
   --start "$START" \

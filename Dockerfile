@@ -1,7 +1,7 @@
 FROM freqtradeorg/freqtrade:stable
 
 USER root
-RUN pip install --no-cache-dir "aiohttp>=3.10,<4"
+RUN pip install --no-cache-dir "aiohttp>=3.10,<4" "scikit-learn>=1.5,<2"
 
 COPY strategies /opt/rmv5/strategies
 COPY tools /opt/rmv5/tools

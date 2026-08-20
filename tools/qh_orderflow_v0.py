@@ -199,20 +199,30 @@ def parse_daily_zip(path: Path, symbol: str) -> list[tuple]:
 def fetch_and_parse(job: ArchiveFile, tmpdir: Path, timeout: float) -> tuple[ArchiveFile, str, list[tuple], str | None]:
     target = tmpdir / f"{job.symbol}-{job.stamp}.zip"
     part = target.with_suffix(".zip.part")
+    last_error = None
     try:
-        with requests.get(job.url, stream=True, timeout=(20, timeout), headers={"User-Agent": "freqtrade-v5-qh-orderflow/1.0"}) as r:
-            if r.status_code == 404:
-                return job, "missing", [], None
-            r.raise_for_status()
-            with open(part, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        os.replace(part, target)
-        rows = parse_daily_zip(target, job.symbol)
-        return job, "ok", rows, None
-    except Exception as exc:
-        return job, "error", [], f"{type(exc).__name__}: {exc}"
+        for attempt in range(5):
+            try:
+                try:
+                    part.unlink()
+                except FileNotFoundError:
+                    pass
+                with requests.get(job.url, stream=True, timeout=(20, timeout), headers={"User-Agent": "freqtrade-v5-qh-orderflow/1.0"}) as r:
+                    if r.status_code == 404:
+                        return job, "missing", [], None
+                    r.raise_for_status()
+                    with open(part, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                os.replace(part, target)
+                rows = parse_daily_zip(target, job.symbol)
+                return job, "ok", rows, None
+            except Exception as exc:
+                last_error = exc
+                if attempt < 4:
+                    time.sleep(min(2.0 ** attempt, 12.0))
+        return job, "error", [], f"{type(last_error).__name__}: {last_error}"
     finally:
         for p in (part, target):
             try:

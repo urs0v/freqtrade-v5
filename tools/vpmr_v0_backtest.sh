@@ -22,7 +22,7 @@ echo "Strategy: paper rules, developing POC (no full-day lookahead), 1x leverage
 echo "Cost stress: 0.07% per side = 0.14% round trip"
 echo
 
-echo "[1/3] Downloading real Binance USD-M futures candles (1m + 5m)..."
+echo "[1/4] Downloading real Binance USD-M futures candles (1m + 5m)..."
 freqtrade download-data \
   -c "$CONFIG" \
   --trading-mode futures \
@@ -32,7 +32,7 @@ freqtrade download-data \
   --candle-types futures
 
 echo
-echo "[2/3] Downloading funding-rate and mark data..."
+echo "[2/4] Downloading funding-rate and mark data..."
 freqtrade download-data \
   -c "$CONFIG" \
   --trading-mode futures \
@@ -42,15 +42,26 @@ freqtrade download-data \
   --candle-types funding_rate mark
 
 echo
-echo "[3/3] Running stop-loss sensitivity: 2%, 3%, 5%..."
+echo "[3/4] Verifying downloaded candle coverage..."
+freqtrade list-data \
+  -c "$CONFIG" \
+  --trading-mode futures \
+  --pairs "$PAIR" \
+  --show-timerange | tee "$OUT/data_coverage.log"
+
+echo
+echo "[4/4] Running stop-loss sensitivity: 2%, 3%, 5%..."
 for SL in 0.02 0.03 0.05; do
   export VPMR_STOPLOSS="$SL"
   LABEL="${SL/0./}pct"
-  RESULT="$OUT/vpmr_v0_sl_${LABEL}.json"
+  LOG="$OUT/vpmr_v0_sl_${LABEL}.log"
+  RESULT_DIR="$OUT/sl_${LABEL}"
+  mkdir -p "$RESULT_DIR"
 
   echo
   echo "------------------------------------------------------------"
   echo "STOP LOSS = $SL"
+  echo "Full output: $LOG"
   echo "------------------------------------------------------------"
 
   freqtrade backtesting \
@@ -67,10 +78,29 @@ for SL in 0.02 0.03 0.05; do
     --cache none \
     --breakdown month year \
     --export trades \
-    --export-filename "$RESULT"
+    --backtest-directory "$RESULT_DIR" \
+    2>&1 | tee "$LOG"
 done
 
 echo
+echo "=== COMPACT SUMMARY ==="
+for SL in 0.02 0.03 0.05; do
+  LABEL="${SL/0./}pct"
+  LOG="$OUT/vpmr_v0_sl_${LABEL}.log"
+  echo
+  echo "--- STOP LOSS $SL ---"
+  grep -E \
+    "Backtesting from|Backtesting to|Total/Daily Avg Trades|Starting balance|Final balance|Total profit %|Profit factor|Expectancy \(Ratio\)|Long / Short trades|Long / Short profit %|Max % of account underwater|Absolute drawdown|Sharpe \(closed trades\)|Max Consecutive Wins / Loss" \
+    "$LOG" || true
+  echo "Strategy summary:"
+  awk '/STRATEGY SUMMARY/{flag=1; count=0} flag{print; count++} flag && count>=12{flag=0}' "$LOG" | tail -n 12 || true
+done
+
+echo
+echo "=== DATA COVERAGE ==="
+cat "$OUT/data_coverage.log" || true
+
+echo
 echo "=== DONE ==="
-echo "Results are under: $OUT"
-echo "Paste the three Freqtrade summary tables back into ChatGPT."
+echo "All logs/results are under: $OUT"
+echo "Paste everything from '=== COMPACT SUMMARY ===' through '=== DONE ===' into ChatGPT."

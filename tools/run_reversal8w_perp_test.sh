@@ -14,7 +14,7 @@ echo "DB:         $DB"
 echo "No downloads. Reuses completed Binance 6h/funding archive."
 echo
 
-python /opt/rmv5/tools/reversal8w_perp_test.py \
+python /opt/rmv5/tools/reversal8w_perp_test_v2.py \
   --db "$DB" \
   --start "$START" \
   --end "$END" \

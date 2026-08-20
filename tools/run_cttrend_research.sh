@@ -24,8 +24,8 @@ python /opt/rmv5/tools/backfill_adaptivetrend_core_data_fast.py \
   --workers "$WORKERS"
 
 echo
-echo "[2/2] Running pre-registered CTREND reconstruction..."
-python /opt/rmv5/tools/cttrend_research.py \
+echo "[2/2] Running pre-registered unbiased CTREND reconstruction..."
+python /opt/rmv5/tools/cttrend_research_v2.py \
   --db "$DB" \
   --start "$EVAL_START" \
   --end "$EVAL_END" \

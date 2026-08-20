@@ -33,7 +33,11 @@ def attach_forward_exits(sun: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
     sun = sun.copy()
     sun["planned_exit_date"] = sun["date"] + pd.Timedelta(days=7)
     sun["exit_close"] = np.nan
-    sun["actual_exit_date"] = pd.NaT
+    # Keep the column explicitly UTC-aware. Pandas 3.x rejects assigning a
+    # timezone-aware Timestamp into a tz-naive datetime64[ns] column.
+    sun["actual_exit_date"] = pd.Series(
+        pd.NaT, index=sun.index, dtype="datetime64[ns, UTC]"
+    )
     sun["forced_exit"] = False
     sun["archive_gap_exit"] = False
 
@@ -50,7 +54,9 @@ def attach_forward_exits(sun: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
             no_exit_count += len(idx)
             continue
 
-        dates = g["date"].to_numpy(dtype="datetime64[ns]")
+        # searchsorted works on tz-naive numpy datetime64 values. Convert only
+        # for the search; all DataFrame-facing timestamps remain UTC-aware.
+        dates = g["date"].dt.tz_convert(None).to_numpy(dtype="datetime64[ns]")
         closes = g["close"].to_numpy(dtype=float)
         last_date = pd.Timestamp(g["date"].iloc[-1])
 
@@ -60,12 +66,13 @@ def attach_forward_exits(sun: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
 
             # Deterministic weekly execution proxy: latest complete archived day
             # at or before the planned exit. Never use a price after planned exit.
-            pos = int(np.searchsorted(dates, planned.to_datetime64(), side="right") - 1)
+            planned_naive = planned.tz_convert(None) if planned.tzinfo is not None else planned
+            pos = int(np.searchsorted(dates, planned_naive.to_datetime64(), side="right") - 1)
             if pos < 0:
                 no_exit_count += 1
                 continue
 
-            actual = pd.Timestamp(dates[pos]).tz_localize("UTC") if pd.Timestamp(dates[pos]).tzinfo is None else pd.Timestamp(dates[pos])
+            actual = pd.Timestamp(dates[pos]).tz_localize("UTC")
             # A valid holding-period exit must occur strictly after the rebalance.
             if actual <= entry_date:
                 no_exit_count += 1

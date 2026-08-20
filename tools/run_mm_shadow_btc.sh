@@ -5,6 +5,8 @@ HOURS="${1:-6}"
 OUT="/freqtrade/user_data/mm_shadow_btc"
 mkdir -p "$OUT"
 
+python -m py_compile /opt/rmv5/tools/mm_shadow_btc.py /opt/rmv5/tools/mm_shadow_report.py
+
 SECS=$(python - <<PY
 print(float("$HOURS") * 3600.0)
 PY

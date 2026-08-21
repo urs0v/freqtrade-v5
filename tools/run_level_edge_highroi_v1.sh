@@ -3,8 +3,9 @@ set -euo pipefail
 
 echo "=== LEVEL EDGE HIGH-ROI V1 RUNNER ==="
 echo "Causal level-event research only; production frozen WS strategy is untouched."
+echo "Post-scan portfolio search runs in parallel and reuses completed CSV stages."
 
-python /opt/rmv5/tools/level_edge_highroi_v1.py \
+python /opt/rmv5/tools/level_edge_highroi_v1_fast.py \
   --config /freqtrade/user_data/v7/config-v7-core-backtest.json \
   --datadir /freqtrade/user_data/data/binance \
   --outdir /freqtrade/user_data/level_edge_highroi_v1 \

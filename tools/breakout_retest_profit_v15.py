@@ -43,10 +43,22 @@ def fmt(m):
     return f"N={m['N']:4d} PF={m['PF']:5.2f} WR={m['WR']:5.1f}% EXP={m['EXP']:+.3f}R DD={m['DD']:6.1f}R"
 
 
+def _ns_utc(s: pd.Series) -> pd.Series:
+    """Force one exact timezone-aware datetime dtype for pandas merge_asof.
+
+    Pandas 3 / Python 3.14 can preserve CSV timestamps at microsecond precision
+    while OHLCV preprocessing returns nanosecond precision. merge_asof requires
+    identical key dtypes, so normalize both sides explicitly.
+    """
+    return pd.to_datetime(s, utc=True).astype("datetime64[ns, UTC]")
+
+
 def activity_lookup(a15: pd.DataFrame, query: pd.DataFrame, offset_min: int, value_name: str):
     q = query[["_row", "entry_time"]].copy()
-    q["query_time"] = q.entry_time + pd.Timedelta(minutes=offset_min)
+    q["entry_time"] = _ns_utc(q["entry_time"])
+    q["query_time"] = _ns_utc(q["entry_time"] + pd.Timedelta(minutes=offset_min))
     a = a15[["signal_time", "activity_score", "natr_ratio30d", "qvol24_ratio30d"]].copy()
+    a["signal_time"] = _ns_utc(a["signal_time"])
     q = q.sort_values("query_time")
     a = a.sort_values("signal_time")
     m = pd.merge_asof(
@@ -75,7 +87,7 @@ def main():
     out = Path(a.outdir); out.mkdir(parents=True, exist_ok=True)
     src = Path(a.v1dir) / "base_trades.csv"
     df = pd.read_csv(src)
-    df["entry_time"] = pd.to_datetime(df.entry_time, utc=True)
+    df["entry_time"] = _ns_utc(df["entry_time"])
     df["_row"] = np.arange(len(df), dtype=int)
     cfg = json.loads(Path(a.config).read_text())
     datadir = Path(a.datadir)

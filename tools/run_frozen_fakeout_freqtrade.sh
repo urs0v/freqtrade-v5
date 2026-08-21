@@ -8,10 +8,12 @@ FEEDDIR="${FEEDDIR:-$USERDATA/frozen_fakeout_feed}"
 CONFIG="${CONFIG:-$ROOT/config-frozen-fakeout.dryrun.json}"
 STRATEGY_PATH="${STRATEGY_PATH:-$ROOT/strategies}"
 STRATEGY="FrozenFakeoutV1"
+DB_PATH="${DB_PATH:-$USERDATA/trades-frozen-fakeout.sqlite}"
 DB_URL="${DB_URL:-sqlite:////freqtrade/user_data/trades-frozen-fakeout.sqlite}"
 PARITY_JSON="$USERDATA/prospective_fakeout_v2/parity_pass.json"
 PARITY_PY="$ROOT/tools/prospective_fakeout_v2_parity.py"
 FEED_PY="$ROOT/tools/frozen_fakeout_signal_feed.py"
+REPORT_PY="$ROOT/tools/frozen_fakeout_freqtrade_report.py"
 FEED_PID="$OUTDIR/feed.pid"
 BOT_PID="$OUTDIR/freqtrade.pid"
 FEED_LOG="$OUTDIR/feed.log"
@@ -34,9 +36,11 @@ preflight() {
   command -v freqtrade >/dev/null 2>&1 || { echo "freqtrade executable not found" >&2; return 1; }
   [[ -f "$CONFIG" ]] || { echo "Missing config: $CONFIG" >&2; return 1; }
   [[ -f "$FEED_PY" ]] || { echo "Missing feed: $FEED_PY" >&2; return 1; }
+  [[ -f "$REPORT_PY" ]] || { echo "Missing report helper: $REPORT_PY" >&2; return 1; }
   [[ -f "$STRATEGY_PATH/$STRATEGY.py" ]] || { echo "Missing strategy: $STRATEGY_PATH/$STRATEGY.py" >&2; return 1; }
 
-  python -m py_compile "$FEED_PY" "$STRATEGY_PATH/$STRATEGY.py"
+  python -m py_compile "$FEED_PY" "$REPORT_PY" "$STRATEGY_PATH/$STRATEGY.py"
+  python -m json.tool "$CONFIG" >/dev/null
   if ! freqtrade list-strategies --strategy-path "$STRATEGY_PATH" --no-color -1 2>&1 | grep -qx "$STRATEGY"; then
     echo "Freqtrade could not load $STRATEGY" >&2
     freqtrade list-strategies --strategy-path "$STRATEGY_PATH" --no-color 2>&1 || true
@@ -48,7 +52,7 @@ preflight() {
     PYTHONUNBUFFERED=1 python -u "$PARITY_PY" --outdir "$USERDATA/prospective_fakeout_v2"
   fi
   parity_ok || { echo "PARITY_PASS is required. Refusing to start Freqtrade." >&2; return 1; }
-  echo "Preflight: strategy loads, config exists, historical parity=PASS."
+  echo "Preflight: strategy loads, config parses, historical parity=PASS."
 }
 
 stop_pidfile() {
@@ -75,10 +79,10 @@ start_all() {
     return 0
   fi
 
-  # The old custom prospective tracker used the same expensive full-history scan.
-  # Stop only its process; its files and the original 19:15 UTC cutoff are preserved
-  # and are reused by the executable feed.
-  if [[ -x "$ROOT/tools/run_prospective_fakeout_v2.sh" || -f "$ROOT/tools/run_prospective_fakeout_v2.sh" ]]; then
+  # Retire the older custom paper loop to avoid two full-history scanners using
+  # CPU at once. Its files and original prospective cutoff are preserved, and
+  # the executable feed inherits that cutoff.
+  if [[ -f "$ROOT/tools/run_prospective_fakeout_v2.sh" ]]; then
     bash "$ROOT/tools/run_prospective_fakeout_v2.sh" stop >/dev/null 2>&1 || true
   fi
 
@@ -134,9 +138,7 @@ case "$cmd" in
     [[ -f "$FEEDDIR/snapshot.json" ]] && { echo "--- FEED SNAPSHOT ---"; cat "$FEEDDIR/snapshot.json"; }
     ;;
   report)
-    [[ -f "$FEEDDIR/snapshot.json" ]] && { echo "=== SIGNAL FEED ==="; cat "$FEEDDIR/snapshot.json"; echo; }
-    echo "=== FREQTRADE TRADES ==="
-    freqtrade show-trades --db-url "$DB_URL" || true
+    python "$REPORT_PY" --db "$DB_PATH" --feed "$FEEDDIR"
     ;;
   log)
     echo "=== SIGNAL FEED LOG ==="

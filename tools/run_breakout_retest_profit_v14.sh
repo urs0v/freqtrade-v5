@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "=== BREAKOUT / RETEST PROFIT V1.4 RUNNER ==="
-echo "Frozen V1.3 signal -> exact 5m exits -> $100 capital/concurrency/leverage/funding realism. No signal tuning."
+echo 'Frozen V1.3 signal -> exact 5m exits -> $100 capital/concurrency/leverage/funding realism. No signal tuning.'
 
 V13DIR="${V13DIR:-/freqtrade/user_data/breakout_retest_profit_v13}"
 OUTDIR="${OUTDIR:-/freqtrade/user_data/breakout_retest_profit_v14}"

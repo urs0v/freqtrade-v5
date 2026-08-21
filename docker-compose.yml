@@ -4,9 +4,13 @@ services:
       context: .
     restart: unless-stopped
     environment:
+      RMV5_BOT_MODE: "${RMV5_BOT_MODE:-frozen_fakeout}"
       RMV5_FORCE_20X: "true"
       RMV5_TOP_N: "20"
       RMV5_FEATURE_DB: "/freqtrade/user_data/v5/features.sqlite"
+      FREQTRADE__API_SERVER__ENABLED: "true"
+      FREQTRADE__API_SERVER__LISTEN_IP_ADDRESS: "0.0.0.0"
+      FREQTRADE__API_SERVER__LISTEN_PORT: "8080"
       FREQTRADE__API_SERVER__JWT_SECRET_KEY: "${FREQTRADE__API_SERVER__JWT_SECRET_KEY}"
       FREQTRADE__API_SERVER__WS_TOKEN: "${FREQTRADE__API_SERVER__WS_TOKEN}"
       FREQTRADE__API_SERVER__USERNAME: "${FREQTRADE__API_SERVER__USERNAME:-freqtrader}"

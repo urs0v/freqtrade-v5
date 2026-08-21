@@ -15,20 +15,18 @@ fi
 
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/run.log"
-STATUS="$OUTDIR/status.txt"
 
 echo "=== LEVEL BOUNCE / BREAK-RETEST AUDIT ==="
 echo "CACHE ONLY: this runner does not download market data."
-echo "Python output is unbuffered; heartbeat every ${HEARTBEAT_SEC}s."
+echo "Python output is unbuffered; stage logs + heartbeat every ${HEARTBEAT_SEC}s."
 echo "CONFIG=$CONFIG"
 echo "DATADIR=$DATADIR"
 echo "START=$START END=$END"
 echo
 
-: > "$STATUS"
 START_TS=$(date +%s)
 
-PYTHONUNBUFFERED=1 python -u /opt/rmv5/tools/audit_level_edge.py \
+PYTHONUNBUFFERED=1 python -u /opt/rmv5/tools/audit_level_edge_verbose.py \
   --config "$CONFIG" \
   --datadir "$DATADIR" \
   --outdir "$OUTDIR" \

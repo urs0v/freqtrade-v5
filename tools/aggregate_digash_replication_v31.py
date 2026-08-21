@@ -136,8 +136,8 @@ def main() -> int:
 
     print("\n=== DIGASH REPLICATION V3.1 AGGREGATE ===", flush=True)
     print(f"pairs={df.pair.nunique()} | deduplicated events={len(df):,}", flush=True)
-    print("V3.1 fixes target semantics: long targets only known resistance; short targets only known support.", flush=True)
-    print("RR is reported both to any opposing TF and to same-or-higher-TF opposing structure.", flush=True)
+    print("Targets are nearest already-known horizontal levels in trade direction; original S/R labels are not frozen after breaks.", flush=True)
+    print("RR is reported both to any known TF and to same-or-higher-TF horizontal structure.", flush=True)
     print("Horizontal level lifetime remains 0 as in the public walkthrough; no invented age expiry is applied.", flush=True)
     print("Historical trade-count and order-book densities remain unavailable and are not fabricated.", flush=True)
 

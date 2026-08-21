@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir "aiohttp>=3.10,<4" "scikit-learn>=1.5,<2"
 COPY strategies /opt/rmv5/strategies
 COPY tools /opt/rmv5/tools
 COPY config-v5.base.json /opt/rmv5/config-v5.base.json
+COPY config-frozen-fakeout.dryrun.json /opt/rmv5/config-frozen-fakeout.dryrun.json
 COPY entrypoint-v5.sh /opt/rmv5/entrypoint-v5.sh
 
 # Collector stores derivatives data using the canonical SQLite column names

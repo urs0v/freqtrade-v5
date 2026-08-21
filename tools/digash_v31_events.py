@@ -302,25 +302,59 @@ def dedup_events(events: list[V31Event]) -> list[V31Event]:
     return sorted(buckets.values(), key=lambda z: (z.signal_idx, z.setup, z.side))
 
 
-def _next_price(prices: list[float], side: int, entry: float, level: float) -> float:
-    if not prices:
+def _next_price(nodes: list[tuple[float, int]], side: int, entry: float, level: float) -> float:
+    if not nodes:
         return np.nan
     if side > 0:
         floor = max(entry, level * (1.0 + TARGET_SAME_ZONE_PCT))
-        j = bisect.bisect_right(prices, floor)
-        return float(prices[j]) if j < len(prices) else np.nan
+        j = bisect.bisect_right(nodes, (floor, 10**18))
+        return float(nodes[j][0]) if j < len(nodes) else np.nan
     ceil = min(entry, level * (1.0 - TARGET_SAME_ZONE_PCT))
-    j = bisect.bisect_left(prices, ceil) - 1
-    return float(prices[j]) if j >= 0 else np.nan
+    j = bisect.bisect_left(nodes, (ceil, -1)) - 1
+    return float(nodes[j][0]) if j >= 0 else np.nan
 
 
-def assign_targets(events: list[V31Event], levels: list[Level], x5: pd.DataFrame) -> dict[int, dict[str, float]]:
+def assign_targets(
+    events: list[V31Event], levels: list[Level], x5: pd.DataFrame,
+    lifecycle_events: list[V31Event] | None = None,
+) -> dict[int, dict[str, float]]:
     if not events or not levels:
         return {}
+    lifecycle_events = lifecycle_events or events
+    level_map = {lv.level_id: lv for lv in levels}
     levs = sorted(levels, key=lambda z: z.formed_time)
     lp = 0
-    any_prices = {"R": [], "S": []}
+    any_nodes: dict[str, list[tuple[float, int]]] = {"R": [], "S": []}
     thresholds = {m: {"R": [], "S": []} for m in sorted(set(TF_MINUTES.values()))}
+    role: dict[int, str] = {}
+
+    def add_level(lv: Level, kind: str) -> None:
+        node = (float(lv.price), int(lv.level_id))
+        bisect.insort(any_nodes[kind], node)
+        for m in thresholds:
+            if lv.tf_minutes >= m:
+                bisect.insort(thresholds[m][kind], node)
+        role[lv.level_id] = kind
+
+    def remove_level(lv: Level, kind: str) -> None:
+        node = (float(lv.price), int(lv.level_id))
+        arr = any_nodes[kind]
+        j = bisect.bisect_left(arr, node)
+        if j < len(arr) and arr[j] == node:
+            arr.pop(j)
+        for m in thresholds:
+            if lv.tf_minutes < m:
+                continue
+            arr = thresholds[m][kind]
+            j = bisect.bisect_left(arr, node)
+            if j < len(arr) and arr[j] == node:
+                arr.pop(j)
+
+    actions = sorted(
+        (e for e in lifecycle_events if e.setup in ("H_BREAK", "H_FAKEOUT")),
+        key=lambda e: (e.signal_idx, 0 if e.setup == "H_BREAK" else 1),
+    )
+    ap = 0
     times = pd.to_datetime(x5["signal_time"], utc=True)
     out: dict[int, dict[str, float]] = {}
 
@@ -328,16 +362,23 @@ def assign_targets(events: list[V31Event], levels: list[Level], x5: pd.DataFrame
         ts = pd.Timestamp(times.iloc[e.signal_idx])
         while lp < len(levs) and pd.Timestamp(levs[lp].formed_time) <= ts:
             lv = levs[lp]
-            bisect.insort(any_prices[lv.kind], lv.price)
-            for m in thresholds:
-                if lv.tf_minutes >= m:
-                    bisect.insort(thresholds[m][lv.kind], lv.price)
+            add_level(lv, lv.kind)
             lp += 1
+
+        while ap < len(actions) and actions[ap].signal_idx <= e.signal_idx:
+            a = actions[ap]
+            lv = level_map.get(a.level_id)
+            if lv is not None and lv.level_id in role:
+                old = role[lv.level_id]
+                remove_level(lv, old)
+                new = ("S" if a.side > 0 else "R") if a.setup == "H_BREAK" else lv.kind
+                add_level(lv, new)
+            ap += 1
 
         entry = float(x5.iloc[e.entry_idx]["open"]) if e.entry_idx < len(x5) else e.level_price
         target_kind = "R" if e.side > 0 else "S"
         out[ei] = {
-            "any": _next_price(any_prices[target_kind], e.side, entry, e.level_price),
+            "any": _next_price(any_nodes[target_kind], e.side, entry, e.level_price),
             "htf": _next_price(thresholds[e.tf_minutes][target_kind], e.side, entry, e.level_price),
         }
     return out

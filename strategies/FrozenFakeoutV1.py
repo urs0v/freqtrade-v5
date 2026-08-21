@@ -46,6 +46,7 @@ class FrozenFakeoutV1(IStrategy):
     RISK_MAX_BPS = 3000.0
     MAINT_MARGIN_FRAC = 0.005
     MAX_SIGNAL_AGE_SECONDS = 285.0
+    MAX_PUBLISH_AGE_SECONDS = 45.0
 
     _feed_mtime_ns: int | None = None
     _feed: DataFrame | None = None
@@ -74,8 +75,9 @@ class FrozenFakeoutV1(IStrategy):
         try:
             z = pd.read_csv(path)
             if not z.empty:
-                z["signal_time"] = pd.to_datetime(z["signal_time"], utc=True, errors="coerce")
-                z["entry_time"] = pd.to_datetime(z["entry_time"], utc=True, errors="coerce")
+                for c in ["signal_time", "entry_time", "published_at"]:
+                    if c in z:
+                        z[c] = pd.to_datetime(z[c], utc=True, errors="coerce")
                 for c in ["side", "stop_price", "activity_score", "risk_bps", "entry_price"]:
                     if c in z:
                         z[c] = pd.to_numeric(z[c], errors="coerce")
@@ -190,6 +192,11 @@ class FrozenFakeoutV1(IStrategy):
         risk_bps = risk_abs / float(rate) * 10000.0 if risk_abs > 0 else np.nan
         return sig, risk_abs, risk_bps
 
+    @staticmethod
+    def _utc_timestamp(v) -> pd.Timestamp:
+        t = pd.Timestamp(v)
+        return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
     def confirm_trade_entry(
         self,
         pair: str,
@@ -213,14 +220,17 @@ class FrozenFakeoutV1(IStrategy):
         if not (self.RISK_MIN_BPS <= risk_bps <= self.RISK_MAX_BPS):
             return False
 
-        model_entry = pd.Timestamp(sig["entry_time"])
-        now = pd.Timestamp(current_time)
-        if model_entry.tzinfo is None:
-            model_entry = model_entry.tz_localize("UTC")
-        if now.tzinfo is None:
-            now = now.tz_localize("UTC")
+        now = self._utc_timestamp(current_time)
+        model_entry = self._utc_timestamp(sig["entry_time"])
         age = (now - model_entry).total_seconds()
         if age < -5.0 or age > self.MAX_SIGNAL_AGE_SECONDS:
+            return False
+
+        published = sig.get("published_at")
+        if published is None or pd.isna(published):
+            return False
+        publish_age = (now - self._utc_timestamp(published)).total_seconds()
+        if publish_age < -5.0 or publish_age > self.MAX_PUBLISH_AGE_SECONDS:
             return False
 
         # Same execution-feasibility rule used in the $100 portfolio realism audit.

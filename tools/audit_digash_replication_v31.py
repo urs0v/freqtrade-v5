@@ -59,8 +59,11 @@ def main() -> int:
     if not levels:
         raise RuntimeError(f"No levels for {pair}")
 
-    events = dedup_events(detect_events(x5, levels))
-    targets = assign_targets(events, levels, x5)
+    # Keep the full causal event stream for level-role lifecycle (R->S / S->R on break,
+    # restored on quick fakeout). Deduplication is only for the simulated trade sample.
+    raw_events = detect_events(x5, levels)
+    events = dedup_events(raw_events)
+    targets = assign_targets(events, levels, x5, lifecycle_events=raw_events)
     level_map = {z.level_id: z for z in levels}
 
     progress("simulate", 0, max(len(events), 1))
@@ -82,9 +85,10 @@ def main() -> int:
     pd.DataFrame([asdict(x) for x in levels]).to_csv(outdir / "levels.csv", index=False)
     pd.DataFrame([{
         "pair": pair, "detail_source": source, "bars5": len(x5), "bars15": len(x15),
-        "levels": len(levels), "dedup_events": len(df), "elapsed_s": time.monotonic()-t0,
+        "levels": len(levels), "raw_events": len(raw_events), "dedup_events": len(df),
+        "elapsed_s": time.monotonic()-t0,
     }]).to_csv(outdir / "coverage.csv", index=False)
-    log(f"DONE|{pair}|levels={len(levels)}|events={len(df)}|elapsed={time.monotonic()-t0:.1f}s")
+    log(f"DONE|{pair}|levels={len(levels)}|raw_events={len(raw_events)}|events={len(df)}|elapsed={time.monotonic()-t0:.1f}s")
     return 0
 
 

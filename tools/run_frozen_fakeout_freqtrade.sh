@@ -20,6 +20,22 @@ FEED_LOG="$OUTDIR/feed.log"
 BOT_LOG="$OUTDIR/freqtrade.log"
 mkdir -p "$OUTDIR" "$FEEDDIR"
 
+# A deployed RMV5 container exports partial API_SERVER overrides for its primary
+# dashboard bot. A second/manual dry-run must not inherit those overrides: in
+# Freqtrade 2026.7 they replace the whole api_server object and make otherwise
+# valid configs fail schema validation. The dedicated config is complete and has
+# its API disabled; deployed dashboard mode is handled by docker-compose/entrypoint.
+FT_CLEAN_API_ENV=(
+  env
+  -u FREQTRADE__API_SERVER__ENABLED
+  -u FREQTRADE__API_SERVER__LISTEN_IP_ADDRESS
+  -u FREQTRADE__API_SERVER__LISTEN_PORT
+  -u FREQTRADE__API_SERVER__JWT_SECRET_KEY
+  -u FREQTRADE__API_SERVER__WS_TOKEN
+  -u FREQTRADE__API_SERVER__USERNAME
+  -u FREQTRADE__API_SERVER__PASSWORD
+)
+
 alive_file() {
   local f="$1"
   [[ -f "$f" ]] || return 1
@@ -41,9 +57,9 @@ preflight() {
 
   python -m py_compile "$FEED_PY" "$REPORT_PY" "$STRATEGY_PATH/$STRATEGY.py"
   python -m json.tool "$CONFIG" >/dev/null
-  if ! freqtrade list-strategies --strategy-path "$STRATEGY_PATH" --no-color -1 2>&1 | grep -qx "$STRATEGY"; then
+  if ! "${FT_CLEAN_API_ENV[@]}" freqtrade list-strategies --strategy-path "$STRATEGY_PATH" --no-color -1 2>&1 | grep -qx "$STRATEGY"; then
     echo "Freqtrade could not load $STRATEGY" >&2
-    freqtrade list-strategies --strategy-path "$STRATEGY_PATH" --no-color 2>&1 || true
+    "${FT_CLEAN_API_ENV[@]}" freqtrade list-strategies --strategy-path "$STRATEGY_PATH" --no-color 2>&1 || true
     return 1
   fi
 
@@ -98,7 +114,7 @@ start_all() {
     return 1
   fi
 
-  nohup env FROZEN_FAKEOUT_FEED="$FEEDDIR/signals.csv" PYTHONUNBUFFERED=1 \
+  nohup "${FT_CLEAN_API_ENV[@]}" env FROZEN_FAKEOUT_FEED="$FEEDDIR/signals.csv" PYTHONUNBUFFERED=1 \
     freqtrade trade \
       --config "$CONFIG" \
       --strategy "$STRATEGY" \
@@ -114,10 +130,11 @@ start_all() {
     return 1
   fi
 
-  echo "FrozenFakeoutV1 Freqtrade dry-run started."
+  echo "FrozenFakeoutV1 Freqtrade dry-run started (standalone API disabled)."
   echo "feed pid=$fp | freqtrade pid=$bp"
   echo "feed=$FEEDDIR/signals.csv"
   echo "db=$DB_URL"
+  echo "For trading.frostlime.com, deploy the repo in RMV5_BOT_MODE=frozen_fakeout instead of running a second bot."
   echo "status: bash $ROOT/tools/run_frozen_fakeout_freqtrade.sh status"
   echo "report: bash $ROOT/tools/run_frozen_fakeout_freqtrade.sh report"
   echo "logs:   bash $ROOT/tools/run_frozen_fakeout_freqtrade.sh log"

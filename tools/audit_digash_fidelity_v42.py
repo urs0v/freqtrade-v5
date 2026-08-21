@@ -44,7 +44,7 @@ def _first_close_invalidation(lv: dc.Level, close: np.ndarray, sig_ns: np.ndarra
     return int(sig_ns[start + int(q[0])])
 
 
-def _nearest(levels: list[dc.Level], pub: float): tuple[float, float, str] | tuple[float, float, str]:
+def _nearest(levels: list[dc.Level], pub: float) -> tuple[float, float, str]:
     if not levels:
         return np.nan, np.nan, ""
     best = min(levels, key=lambda lv: abs(float(lv.price) / pub - 1.0))

@@ -10,7 +10,7 @@ import pandas as pd
 import digash_v31_events as de
 
 
-STATE_VERSION = 2
+STATE_VERSION = 1
 
 
 def level_key(lv) -> tuple:
@@ -86,15 +86,19 @@ def detect_events_incremental(
     initial_state: dict[tuple, dict] | None = None,
     prior_signal_time: pd.Timestamp | None = None,
     index_offset: int = 0,
+    structure_override: tuple[float, float] | None = None,
 ):
     """Exact resumable continuation of digash_v31_events.detect_events().
 
     ``start_i`` / ``stop_i`` refer to local dataframe positions. Event indices and
     persisted lifecycle indices are emitted in the global index space defined by
-    ``index_offset``. The default offset is zero, preserving the historical/batch
-    behavior. Live callers can therefore keep only a small OHLCV tail while age,
-    causal 3-bar dedup and lifecycle state continue in the original global index
-    space.
+    ``index_offset``. The default offset is zero, preserving historical behavior.
+
+    A live caller that retains only an OHLCV tail can supply the already-confirmed
+    global structure at the one bar being processed via ``structure_override``.
+    This prevents an old confirmed 5m pivot outside the retained tail from changing
+    the structural stop. The override is intentionally restricted to a one-bar
+    continuation; historical/batch callers leave it unset.
     """
     initial_state = initial_state or {}
     natural_end = len(x5) - 2
@@ -106,6 +110,8 @@ def detect_events_incremental(
         return [], dict(initial_state), end_i
     if not levels:
         return [], {}, end_i
+    if structure_override is not None and start_i != end_i:
+        raise ValueError("structure_override requires a one-bar incremental scan")
 
     h = x5["high"].to_numpy(float)
     l = x5["low"].to_numpy(float)
@@ -116,6 +122,10 @@ def detect_events_incremental(
     times = pd.to_datetime(x5["signal_time"], utc=True)
     time_ns = times.astype("int64").to_numpy()
     last_hi, last_lo = de._confirmed_structure_arrays(h, l)
+    if structure_override is not None:
+        sh, sl = structure_override
+        last_hi[start_i] = float(sh) if np.isfinite(sh) else np.nan
+        last_lo[start_i] = float(sl) if np.isfinite(sl) else np.nan
 
     by_price = sorted(levels, key=lambda z: z.price)
     level_prices = np.fromiter((lv.price for lv in by_price), dtype=np.float64, count=len(by_price))
@@ -171,13 +181,12 @@ def detect_events_incremental(
             if bc is not None and not st["bounce_done"]:
                 age = gi - int(bc["idx"])
                 if 1 <= age <= de.BOUNCE_CONFIRM_BARS:
-                    # A live tail is always retained long enough to cover the
-                    # short micro-confirmation lookback used by the frozen rule.
+                    bc_local = i - age
                     if bc["side"] > 0:
-                        micro = float(np.max(h[max(0, i - age - 2):i - age + 1]))
+                        micro = float(np.max(h[max(0, bc_local - 2):bc_local + 1]))
                         confirmed = c[i] > micro
                     else:
-                        micro = float(np.min(l[max(0, i - age - 2):i - age + 1]))
+                        micro = float(np.min(l[max(0, bc_local - 2):bc_local + 1]))
                         confirmed = c[i] < micro
                     if confirmed:
                         near_bars, near_proxy = de._generic_near(c, i, level)

@@ -276,11 +276,12 @@ class LivePairState:
         x15 = dc.prep_ohlcv(raw15, 15)
         x5 = v1._prep_exec(raw5)
         x5 = v1._add_activity(x5, v1._activity15(x15))
-        frames = {
-            "15m": x15,
-            "1h": dc.resample_from_15(x15, "1h", 60),
-            "4h": dc.resample_from_15(x15, "4h", 240),
-        }
+        latest_context = pd.Timestamp(x15["signal_time"].max())
+        x1 = dc.resample_from_15(x15, "1h", 60)
+        x4 = dc.resample_from_15(x15, "4h", 240)
+        x1 = x1[x1["signal_time"] <= latest_context].reset_index(drop=True)
+        x4 = x4[x4["signal_time"] <= latest_context].reset_index(drop=True)
+        frames = {"15m": x15, "1h": x1, "4h": x4}
         levels = LevelSystem(frames)
         events, detector_state, end_i = inc.detect_events_incremental(x5, levels.levels, start_i=1)
         selected, seen = inc.causal_dedup_incremental(events)

@@ -58,11 +58,15 @@ def main() -> int:
         progress("levels", j, len(jobs))
     if not levels:
         raise RuntimeError(f"No levels for {pair}")
-    pd.DataFrame([asdict(x) for x in levels]).to_csv(outdir / "levels.csv", index=False)
+    log(f"LEVELS_READY|{pair}|levels={len(levels)}")
 
+    # Start the event scan immediately. Writing the potentially large diagnostic
+    # levels.csv must not hide scan progress or delay the hot path.
     events = detect_events(x5, levels)
     raw_n = len(events)
     events = dedup_events(events)
+    log(f"EVENTS_DETECTED|{pair}|raw={raw_n}|dedup={len(events)}")
+
     progress("simulate", 0, max(len(events), 1))
     targets = assign_targets(events, levels, x5)
     rows = []
@@ -78,7 +82,10 @@ def main() -> int:
     df = pd.DataFrame(rows)
     if df.empty:
         raise RuntimeError(f"No events inside requested period for {pair}")
+
     df.to_csv(outdir / "events.csv", index=False)
+    # Diagnostic-only output is deliberately serialized after the research hot path.
+    pd.DataFrame([asdict(x) for x in levels]).to_csv(outdir / "levels.csv", index=False)
     pd.DataFrame([{
         "pair": pair,
         "detail_source": source,

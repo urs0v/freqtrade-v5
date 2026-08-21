@@ -12,6 +12,7 @@ import pandas as pd
 
 import breakout_retest_profit_v1 as v1
 import digash_v3_common as dc
+import digash_v31_events as de
 import frozen_fakeout_incremental as inc
 import prospective_fakeout_v2 as p2
 import frozen_fakeout_signal_feed_v2 as feed2
@@ -244,7 +245,7 @@ class LivePairState:
     def __init__(
         self, pair: str, raw5: pd.DataFrame, raw15: pd.DataFrame, level_system: LevelSystem,
         detector_state: dict, dedup_seen: set, last_processed_global: int,
-        prior_signal_time: pd.Timestamp, parity: dict,
+        prior_signal_time: pd.Timestamp, parity: dict, struct_hi: float, struct_lo: float,
     ):
         raw5n = _norm_raw(raw5)
         raw15n = _norm_raw(raw15)
@@ -258,6 +259,8 @@ class LivePairState:
         self.last_processed_global = int(last_processed_global)
         self.prior_signal_time = pd.Timestamp(prior_signal_time)
         self.parity = dict(parity)
+        self.struct_hi = float(struct_hi) if np.isfinite(struct_hi) else np.nan
+        self.struct_lo = float(struct_lo) if np.isfinite(struct_lo) else np.nan
         self.signals: list[dict] = []
 
     @classmethod
@@ -288,10 +291,14 @@ class LivePairState:
         if end_i < 1:
             raise RuntimeError("BOOTSTRAP_TOO_SHORT")
 
+        last_hi, last_lo = de._confirmed_structure_arrays(
+            x5["high"].to_numpy(float), x5["low"].to_numpy(float)
+        )
         state = cls(
             pair=pair, raw5=raw5, raw15=raw15, level_system=levels,
             detector_state=detector_state, dedup_seen=seen, last_processed_global=end_i,
             prior_signal_time=pd.Timestamp(x5.iloc[end_i]["signal_time"]), parity=parity,
+            struct_hi=float(last_hi[end_i]), struct_lo=float(last_lo[end_i]),
         )
         meta = BootstrapMeta(
             pair=pair, parity=parity, rows5=len(raw5), rows15=len(raw15),
@@ -328,6 +335,19 @@ class LivePairState:
         x5 = v1._add_activity(x5, activity)
         return x5, int(self.total5 - len(self.raw5))
 
+    def _advance_structure(self) -> None:
+        if len(self.raw5) < 6:
+            return
+        q = self.raw5.iloc[-6:-1]
+        if len(q) != 5:
+            return
+        highs = q["high"].to_numpy(float)
+        lows = q["low"].to_numpy(float)
+        if highs[2] >= np.max(highs):
+            self.struct_hi = float(highs[2])
+        if lows[2] <= np.min(lows):
+            self.struct_lo = float(lows[2])
+
     def process_boundary(
         self, closed5: dict, open5: dict, *, closed15: dict | None = None,
         received_at: pd.Timestamp | None = None,
@@ -353,6 +373,7 @@ class LivePairState:
             raise RuntimeError(f"OPEN_STUB_ALREADY_EXISTS {boundary}")
         self.total5 += 1
         self.raw5 = self.raw5.tail(TAIL5).reset_index(drop=True)
+        self._advance_structure()
 
         new_levels = self._update_15m_context(closed15, boundary)
         x5, offset = self._prep_tail()
@@ -367,7 +388,7 @@ class LivePairState:
         events, detector_state, _ = inc.detect_events_incremental(
             x5, self.level_system.levels, start_i=signal_local, stop_i=signal_local,
             initial_state=self.detector_state, prior_signal_time=self.prior_signal_time,
-            index_offset=offset,
+            index_offset=offset, structure_override=(self.struct_hi, self.struct_lo),
         )
         selected, seen = inc.causal_dedup_incremental(events, self.dedup_seen)
         self.detector_state = detector_state

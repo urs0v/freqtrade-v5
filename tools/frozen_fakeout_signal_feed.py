@@ -5,7 +5,7 @@ import argparse
 import json
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -25,6 +25,7 @@ def parse_args():
     p.add_argument("--outdir", default=DEFAULT_OUT)
     p.add_argument("--cutoff-state", default=DEFAULT_CUTOFF_STATE)
     p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--sync-workers", type=int, default=20)
     p.add_argument("--loop", action="store_true")
     p.add_argument("--poll-seconds", type=int, default=5)
     return p.parse_args()
@@ -133,6 +134,31 @@ def _sync_tf(cfg: dict, datadir: Path, outdir: Path, pair: str, tf: str, now: pd
     )
 
 
+def _sync_pair(pair: str, cfg: dict, datadir_s: str, outdir_s: str, now_s: str) -> dict:
+    datadir = Path(datadir_s)
+    outdir = Path(outdir_s)
+    now = pd.Timestamp(now_s)
+    bucket = now.floor("5min")
+    started = time.monotonic()
+    try:
+        x5 = _sync_tf(cfg, datadir, outdir, pair, "5m", now)
+        _sync_tf(cfg, datadir, outdir, pair, "15m", now)
+        has_stub = bool(len(x5) and pd.Timestamp(x5.date.max()) == bucket)
+        return {
+            "pair": pair,
+            "status": "OK",
+            "has_entry_stub": has_stub,
+            "elapsed_sec": time.monotonic() - started,
+        }
+    except Exception as e:
+        return {
+            "pair": pair,
+            "status": f"ERROR:{type(e).__name__}:{e}",
+            "has_entry_stub": False,
+            "elapsed_sec": time.monotonic() - started,
+        }
+
+
 def _load_cached_combined(cfg: dict, datadir: Path, outdir: Path, pair: str, tf: str) -> pd.DataFrame:
     cache = outdir / "market_cache" / tf / f"{p2.symbol(pair)}.csv"
     live = p2.read_csv_candles(cache)
@@ -204,21 +230,54 @@ def run_once(a, cutoff: pd.Timestamp):
     datadir = Path(a.datadir)
     scan_started = utc_now().floor("s")
     bucket = scan_started.floor("5min")
+    cycle_t0 = time.monotonic()
 
+    # Public Binance klines for the 20 independent pairs are I/O bound. The old
+    # sequential 40-request sync consumed most of the 5m execution candle. Sync
+    # pairs concurrently; this changes no market data, detector or alpha rule.
+    sync_t0 = time.monotonic()
     sync_status = []
-    for n, pair in enumerate(p2.FROZEN_PAIRS, 1):
-        try:
-            x5 = _sync_tf(cfg, datadir, out, pair, "5m", scan_started)
-            _sync_tf(cfg, datadir, out, pair, "15m", scan_started)
-            has_stub = bool(len(x5) and pd.Timestamp(x5.date.max()) == bucket)
-            sync_status.append({"pair": pair, "status": "OK", "has_entry_stub": has_stub})
-            print(f"sync {n:2d}/{len(p2.FROZEN_PAIRS)} {pair:24s} stub={int(has_stub)}", flush=True)
-        except Exception as e:
-            sync_status.append({"pair": pair, "status": f"ERROR:{type(e).__name__}:{e}", "has_entry_stub": False})
-            print(f"sync {n:2d}/{len(p2.FROZEN_PAIRS)} {pair:24s} ERROR {type(e).__name__}: {e}", flush=True)
+    with ThreadPoolExecutor(max_workers=max(1, min(int(a.sync_workers), len(p2.FROZEN_PAIRS)))) as ex:
+        futs = {
+            ex.submit(
+                _sync_pair,
+                pair,
+                cfg,
+                str(datadir),
+                str(out),
+                scan_started.isoformat(),
+            ): pair
+            for pair in p2.FROZEN_PAIRS
+        }
+        done = 0
+        for fut in as_completed(futs):
+            done += 1
+            pair = futs[fut]
+            try:
+                r = fut.result()
+            except Exception as e:
+                r = {
+                    "pair": pair,
+                    "status": f"ERROR:{type(e).__name__}:{e}",
+                    "has_entry_stub": False,
+                    "elapsed_sec": 0.0,
+                }
+            sync_status.append(r)
+            if r["status"] == "OK":
+                print(
+                    f"sync {done:2d}/{len(p2.FROZEN_PAIRS)} {pair:24s} "
+                    f"stub={int(r['has_entry_stub'])} t={float(r['elapsed_sec']):.1f}s",
+                    flush=True,
+                )
+            else:
+                print(f"sync {done:2d}/{len(p2.FROZEN_PAIRS)} {pair:24s} {r['status']}", flush=True)
+    sync_duration = time.monotonic() - sync_t0
 
+    sync_status.sort(key=lambda r: p2.FROZEN_PAIRS.index(r["pair"]))
     good = [r["pair"] for r in sync_status if r["status"] == "OK" and r["has_entry_stub"]]
+
     rows = []
+    scan_t0 = time.monotonic()
     with ProcessPoolExecutor(max_workers=max(1, min(int(a.workers), len(good) or 1))) as ex:
         futs = {
             ex.submit(_worker, pair, a.config, a.datadir, a.outdir, cutoff.isoformat(), scan_started.isoformat()): pair
@@ -234,6 +293,7 @@ def run_once(a, cutoff: pd.Timestamp):
                 print(f"scan {done:2d}/{len(good)} {pair:24s} signals={len(rr)}", flush=True)
             except Exception as e:
                 print(f"scan {done:2d}/{len(good)} {pair:24s} ERROR {type(e).__name__}: {e}", flush=True)
+    scan_duration = time.monotonic() - scan_t0
 
     z = pd.DataFrame(rows)
     if z.empty:
@@ -281,6 +341,7 @@ def run_once(a, cutoff: pd.Timestamp):
     _write_csv(active, out / "active_signals.csv")
     _write_csv(pd.DataFrame(sync_status), out / "coverage.csv")
 
+    cycle_duration = time.monotonic() - cycle_t0
     summary = {
         "cutoff": cutoff.isoformat(),
         "scan_started": scan_started.isoformat(),
@@ -291,6 +352,11 @@ def run_once(a, cutoff: pd.Timestamp):
         "active_for_freqtrade": int(len(active)),
         "active_ids": active["signal_id"].astype(str).tolist() if len(active) else [],
         "publish_delay_sec": float((checked_at - bucket).total_seconds()),
+        "sync_duration_sec": round(float(sync_duration), 3),
+        "scan_duration_sec": round(float(scan_duration), 3),
+        "cycle_duration_sec": round(float(cycle_duration), 3),
+        "latency_budget_sec": 285.0,
+        "within_entry_candle": bool(checked_at.floor("5min") == bucket),
     }
     (out / "snapshot.json").write_text(json.dumps(summary, indent=2))
     print("\n=== FROZEN FAKEOUT EXECUTABLE FEED ===", flush=True)
@@ -314,7 +380,7 @@ def main():
         now = utc_now()
         bucket = now.floor("5min")
         # 20 seconds gives Binance time to expose the immutable next-candle open.
-        # Freqtrade still receives most of the same 5m candle for real execution.
+        # Freqtrade still receives the same 5m candle for real execution.
         if now.second >= 20 and bucket != last_bucket:
             try:
                 run_once(a, cutoff)

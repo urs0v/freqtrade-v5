@@ -85,11 +85,20 @@ def detect_events_incremental(
     stop_i: int | None = None,
     initial_state: dict[tuple, dict] | None = None,
     prior_signal_time: pd.Timestamp | None = None,
+    index_offset: int = 0,
+    structure_override: tuple[float, float] | None = None,
 ):
     """Exact resumable continuation of digash_v31_events.detect_events().
 
-    stop_i is inclusive and exists only for parity/bootstrap checkpoints. Live
-    continuation normally omits it and processes through len(x5)-2.
+    ``start_i`` / ``stop_i`` refer to local dataframe positions. Event indices and
+    persisted lifecycle indices are emitted in the global index space defined by
+    ``index_offset``. The default offset is zero, preserving historical behavior.
+
+    A live caller that retains only an OHLCV tail can supply the already-confirmed
+    global structure at the one bar being processed via ``structure_override``.
+    This prevents an old confirmed 5m pivot outside the retained tail from changing
+    the structural stop. The override is intentionally restricted to a one-bar
+    continuation; historical/batch callers leave it unset.
     """
     initial_state = initial_state or {}
     natural_end = len(x5) - 2
@@ -101,6 +110,8 @@ def detect_events_incremental(
         return [], dict(initial_state), end_i
     if not levels:
         return [], {}, end_i
+    if structure_override is not None and start_i != end_i:
+        raise ValueError("structure_override requires a one-bar incremental scan")
 
     h = x5["high"].to_numpy(float)
     l = x5["low"].to_numpy(float)
@@ -111,6 +122,10 @@ def detect_events_incremental(
     times = pd.to_datetime(x5["signal_time"], utc=True)
     time_ns = times.astype("int64").to_numpy()
     last_hi, last_lo = de._confirmed_structure_arrays(h, l)
+    if structure_override is not None:
+        sh, sl = structure_override
+        last_hi[start_i] = float(sh) if np.isfinite(sh) else np.nan
+        last_lo[start_i] = float(sl) if np.isfinite(sl) else np.nan
 
     by_price = sorted(levels, key=lambda z: z.price)
     level_prices = np.fromiter((lv.price for lv in by_price), dtype=np.float64, count=len(by_price))
@@ -133,6 +148,7 @@ def detect_events_incremental(
 
     events = []
     for i in range(start_i, end_i + 1):
+        gi = int(index_offset) + int(i)
         if not np.isfinite(atr[i]) or atr[i] <= 0:
             continue
 
@@ -163,20 +179,21 @@ def detect_events_incremental(
 
             bc = st.get("bounce_candidate")
             if bc is not None and not st["bounce_done"]:
-                age = i - bc["idx"]
+                age = gi - int(bc["idx"])
                 if 1 <= age <= de.BOUNCE_CONFIRM_BARS:
+                    bc_local = i - age
                     if bc["side"] > 0:
-                        micro = float(np.max(h[max(0, bc["idx"] - 2):bc["idx"] + 1]))
+                        micro = float(np.max(h[max(0, bc_local - 2):bc_local + 1]))
                         confirmed = c[i] > micro
                     else:
-                        micro = float(np.min(l[max(0, bc["idx"] - 2):bc["idx"] + 1]))
+                        micro = float(np.min(l[max(0, bc_local - 2):bc_local + 1]))
                         confirmed = c[i] < micro
                     if confirmed:
                         near_bars, near_proxy = de._generic_near(c, i, level)
                         extreme = bc["extreme"]
                         stop = extreme - 0.05 * atr[i] if bc["side"] > 0 else extreme + 0.05 * atr[i]
                         events.append(de.V31Event(
-                            "H_BOUNCE", i, i + 1, bc["side"], float(stop), lv.level_id, level, lv.kind,
+                            "H_BOUNCE", gi, gi + 1, bc["side"], float(stop), lv.level_id, level, lv.kind,
                             lv.tf, lv.tf_minutes, lv.period, lv.touch_error_pct, lv.clean_between,
                             int(st["approach"]), near_proxy, near_bars, impulse,
                             confluence_tfs=get_conf(lv, ns), stop_source="reaction_extreme",
@@ -195,26 +212,26 @@ def detect_events_incremental(
                     stop, stop_source = de._breakout_stop(i, side, level, atr, h, l, last_hi, last_lo)
                     break_atr = side * (c[i] - level) / atr[i]
                     events.append(de.V31Event(
-                        "H_BREAK", i, i + 1, side, float(stop), lv.level_id, level, lv.kind,
+                        "H_BREAK", gi, gi + 1, side, float(stop), lv.level_id, level, lv.kind,
                         lv.tf, lv.tf_minutes, lv.period, lv.touch_error_pct, lv.clean_between,
                         int(st["approach"]), proto, near_bars, impulse,
                         confluence_tfs=get_conf(lv, ns), break_distance_atr=float(break_atr),
                         stop_source=stop_source,
                     ))
                     st["break_done"] = True
-                    st["break_idx"] = i
+                    st["break_idx"] = gi
                     st["break_side"] = side
                     st["break_extreme"] = float(h[i] if side > 0 else l[i])
                     continue
 
                 if lv.kind == "S" and l[i] <= level and c[i] >= level:
-                    st["bounce_candidate"] = {"idx": i, "side": +1, "extreme": float(l[i])}
+                    st["bounce_candidate"] = {"idx": gi, "side": +1, "extreme": float(l[i])}
                 elif lv.kind == "R" and h[i] >= level and c[i] <= level:
-                    st["bounce_candidate"] = {"idx": i, "side": -1, "extreme": float(h[i])}
+                    st["bounce_candidate"] = {"idx": gi, "side": -1, "extreme": float(h[i])}
             else:
                 bi = st["break_idx"]
                 bside = st["break_side"]
-                age = i - int(bi)
+                age = gi - int(bi)
                 if age <= 0:
                     continue
                 st["break_extreme"] = (
@@ -230,7 +247,7 @@ def detect_events_incremental(
                         ext = float(st["break_extreme"])
                         stop = ext + 0.05 * atr[i] if side < 0 else ext - 0.05 * atr[i]
                         events.append(de.V31Event(
-                            "H_FAKEOUT", i, i + 1, side, float(stop), lv.level_id, level, lv.kind,
+                            "H_FAKEOUT", gi, gi + 1, side, float(stop), lv.level_id, level, lv.kind,
                             lv.tf, lv.tf_minutes, lv.period, lv.touch_error_pct, lv.clean_between,
                             int(st["approach"]), near_proxy, near_bars, impulse, reclaim_bars=age,
                             confluence_tfs=get_conf(lv, ns), stop_source="sweep_extreme",
@@ -249,7 +266,7 @@ def detect_events_incremental(
                     if touched:
                         near_bars, near_proxy = de._generic_near(c, i, level)
                         events.append(de.V31Event(
-                            "H_RETEST", i, i + 1, bside, float(stop), lv.level_id, level, lv.kind,
+                            "H_RETEST", gi, gi + 1, bside, float(stop), lv.level_id, level, lv.kind,
                             lv.tf, lv.tf_minutes, lv.period, lv.touch_error_pct, lv.clean_between,
                             int(st["approach"]), near_proxy, near_bars, impulse, reclaim_bars=age,
                             confluence_tfs=get_conf(lv, ns), stop_source="retest_extreme",

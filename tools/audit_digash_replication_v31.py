@@ -10,7 +10,8 @@ import numpy as np
 import pandas as pd
 
 from digash_v3_common import *
-from digash_v31_events import detect_events, dedup_events, assign_targets, simulate
+from digash_v31_events import detect_events, dedup_events, simulate
+from digash_v31_targets import assign_targets
 
 
 def main() -> int:
@@ -59,11 +60,9 @@ def main() -> int:
     if not levels:
         raise RuntimeError(f"No levels for {pair}")
 
-    # Keep the full causal event stream for level-role lifecycle (R->S / S->R on break,
-    # restored on quick fakeout). Deduplication is only for the simulated trade sample.
     raw_events = detect_events(x5, levels)
     events = dedup_events(raw_events)
-    targets = assign_targets(events, levels, x5, lifecycle_events=raw_events)
+    targets = assign_targets(events, levels, x5)
     level_map = {z.level_id: z for z in levels}
 
     progress("simulate", 0, max(len(events), 1))

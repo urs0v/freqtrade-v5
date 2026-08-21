@@ -14,11 +14,7 @@ STATE_VERSION = 1
 
 
 def level_key(lv) -> tuple:
-    """Stable identity for a frozen level across append-only history extensions.
-
-    Runtime level_id values can shift when an earlier TF/period group receives a
-    new level, so persisted detector state must not be keyed by level_id.
-    """
+    """Stable identity for a frozen level across append-only history extensions."""
     return (
         str(lv.tf),
         int(lv.period),
@@ -55,11 +51,7 @@ def score_event(e) -> tuple:
 
 
 def causal_dedup_incremental(events, seen_keys: set[tuple] | None = None):
-    """Causal first-bar 3-candle dedup with persistent bucket memory.
-
-    This is the V1.6 rule applied only to newly processed bars. A bucket already
-    seen on a prior live cycle cannot be reconsidered by a later bar.
-    """
+    """V1.6 causal first-bar 3-candle dedup with persistent bucket memory."""
     seen = set(seen_keys or set())
     if not events:
         return [], seen
@@ -90,21 +82,20 @@ def detect_events_incremental(
     levels: list,
     *,
     start_i: int = 1,
+    stop_i: int | None = None,
     initial_state: dict[tuple, dict] | None = None,
     prior_signal_time: pd.Timestamp | None = None,
 ):
-    """Exact continuation of digash_v31_events.detect_events().
+    """Exact resumable continuation of digash_v31_events.detect_events().
 
-    The event loop below intentionally mirrors the frozen detector. Only two
-    operational changes exist: it starts at start_i and restores each level's
-    lifecycle state from a stable level key. If an old level appears that was not
-    present in the checkpoint, continuation is refused so the caller can perform
-    a full causal rebootstrap instead of silently changing the strategy.
+    stop_i is inclusive and exists only for parity/bootstrap checkpoints. Live
+    continuation normally omits it and processes through len(x5)-2.
     """
     initial_state = initial_state or {}
-    end_i = len(x5) - 2
-    if end_i < 1:
-        return [], dict(initial_state), end_i
+    natural_end = len(x5) - 2
+    if natural_end < 1:
+        return [], dict(initial_state), natural_end
+    end_i = natural_end if stop_i is None else min(natural_end, int(stop_i))
     start_i = max(1, int(start_i))
     if start_i > end_i:
         return [], dict(initial_state), end_i
@@ -136,15 +127,12 @@ def detect_events_incremental(
         if k in initial_state:
             state_by_id[lv.level_id] = copy.deepcopy(initial_state[k])
         else:
-            # A level formed before/at the previous checkpoint but is absent from
-            # its state means the append-only assumption was violated. Full replay
-            # is required to preserve exact lifecycle semantics.
             if prior_signal_time is not None and pd.Timestamp(lv.formed_time) <= pd.Timestamp(prior_signal_time):
                 raise RuntimeError(f"INCREMENTAL_REBOOTSTRAP_REQUIRED level={k}")
             state_by_id[lv.level_id] = _fresh_state()
 
     events = []
-    for i in range(start_i, len(x5) - 1):
+    for i in range(start_i, end_i + 1):
         if not np.isfinite(atr[i]) or atr[i] <= 0:
             continue
 

@@ -118,17 +118,15 @@ class FrozenFakeoutV1(IStrategy):
         x["ff_model_entry"] = pd.NaT
 
         z = self._load_feed(force=False)
-        if z is None or z.empty:
+        if z is None or z.empty or "feed_eligible" not in z:
             return x
         pair = str(metadata.get("pair", ""))
         g = z[z["pair"].astype(str).eq(pair)].copy()
         if g.empty:
             return x
 
-        # Only signals that were still alive when the executable feed published
-        # them are eligible. Historical CLOSED rows remain in the feed for audit.
-        if "feed_eligible" in g:
-            g = g[g["feed_eligible"].astype(bool)]
+        eligible = g["feed_eligible"].astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+        g = g[eligible]
         if g.empty:
             return x
 

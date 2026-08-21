@@ -16,7 +16,9 @@ import prospective_fakeout_v2 as p2
 
 
 DEFAULT_OUT = "/freqtrade/user_data/frozen_fakeout_ws_shadow"
-WS_BASE = "wss://fstream.binance.com/stream?streams="
+# Binance retired the legacy USD-M websocket path in 2026. Kline streams now
+# live on the dedicated /market route.
+WS_BASE = "wss://fstream.binance.com/market/stream?streams="
 INTERVALS = ("5m", "15m", "1h", "4h")
 
 

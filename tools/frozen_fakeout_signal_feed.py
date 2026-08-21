@@ -260,6 +260,18 @@ def run_once(a, cutoff: pd.Timestamp):
             ok, reason = _still_executable(z.loc[idx], checked_at)
             z.at[idx, "feed_eligible"] = bool(ok)
             z.at[idx, "feed_reason"] = reason
+
+        # Freqtrade/Binance one-way mode cannot execute two independent positions
+        # on the same pair at the same timestamp. Do not invent a side-selection
+        # rule from prospective data: reject the whole simultaneous conflict.
+        live_idx = z.index[z["feed_eligible"].eq(True)]
+        if len(live_idx):
+            counts = z.loc[live_idx].groupby(["pair", "entry_time"])["signal_id"].transform("size")
+            conflicts = counts[counts > 1].index
+            if len(conflicts):
+                z.loc[conflicts, "feed_eligible"] = False
+                z.loc[conflicts, "feed_reason"] = "PAIR_SIGNAL_CONFLICT"
+
         z["publish_delay_sec"] = (checked_at - z["entry_time"]).dt.total_seconds()
     else:
         z["publish_delay_sec"] = pd.Series(dtype=float)

@@ -4,7 +4,10 @@ set -euo pipefail
 MODE="${RMV5_BOT_MODE:-frozen_fakeout}"
 
 if [[ "$MODE" == "frozen_fakeout" ]]; then
-  mkdir -p /freqtrade/user_data/frozen_fakeout_feed /freqtrade/user_data/prospective_fakeout_v2
+  mkdir -p \
+    /freqtrade/user_data/frozen_fakeout_feed \
+    /freqtrade/user_data/frozen_fakeout_ws_shadow \
+    /freqtrade/user_data/prospective_fakeout_v2
 
   PARITY_JSON="/freqtrade/user_data/prospective_fakeout_v2/parity_pass.json"
   if [[ ! -f "$PARITY_JSON" ]] || ! grep -q '"verdict": "PARITY_PASS"' "$PARITY_JSON"; then
@@ -23,8 +26,16 @@ if [[ "$MODE" == "frozen_fakeout" ]]; then
     --outdir /freqtrade/user_data/frozen_fakeout_feed &
   FEED_PID=$!
 
+  # Shadow-only transport probe. It never writes the execution feed and never
+  # sends orders. This measures the real Binance USD-M websocket close/open
+  # delivery latency before we move the frozen detector onto the websocket path.
+  echo "FrozenFakeout deployment: starting Binance websocket shadow probe."
+  PYTHONUNBUFFERED=1 python -u /opt/rmv5/tools/frozen_fakeout_ws_shadow.py \
+    --outdir /freqtrade/user_data/frozen_fakeout_ws_shadow &
+  WS_SHADOW_PID=$!
+
   cleanup() {
-    kill "$FEED_PID" 2>/dev/null || true
+    kill "$FEED_PID" "$WS_SHADOW_PID" 2>/dev/null || true
   }
   trap cleanup EXIT INT TERM
 

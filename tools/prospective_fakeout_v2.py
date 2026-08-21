@@ -5,7 +5,6 @@ import argparse
 import heapq
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
-import math
 import os
 import time
 import urllib.parse
@@ -33,6 +32,7 @@ HOLD_BARS = 48
 BASE_COST_BPS = 8.0
 STRESS_COST_BPS = 12.0
 WARMUP_DAYS = 60
+HISTORY_START = pd.Timestamp("2022-01-01", tz="UTC")
 LEVEL_TFS = ("15m", "1h", "4h")
 LEVEL_PERIODS = (20, 30)
 
@@ -256,6 +256,7 @@ def init_state(outdir: Path, reset: bool) -> dict:
             "base_cost_bps": BASE_COST_BPS,
             "stress_cost_bps": STRESS_COST_BPS,
             "warmup_days": WARMUP_DAYS,
+            "history_start": HISTORY_START.isoformat(),
             "level_tfs": list(LEVEL_TFS),
             "level_periods": list(LEVEL_PERIODS),
             "portfolio": {
@@ -359,7 +360,9 @@ def _event_outcome(x5: pd.DataFrame, e) -> dict | None:
 
 
 def compute_pair(pair: str, raw5: pd.DataFrame, raw15: pd.DataFrame, cutoff: pd.Timestamp, now: pd.Timestamp) -> list[dict]:
-    warm_start = cutoff - pd.Timedelta(days=WARMUP_DAYS)
+    # Continue the exact frozen historical lifecycle. V1.6 started at 2022-01-01
+    # with a 60-day warmup. Only OUTPUT signals are filtered by the prospective cutoff.
+    warm_start = HISTORY_START - pd.Timedelta(days=WARMUP_DAYS)
     raw5 = raw5[(raw5.date >= warm_start) & (raw5.date < now)].reset_index(drop=True)
     raw15 = raw15[(raw15.date >= warm_start) & (raw15.date < now)].reset_index(drop=True)
     if raw5.empty or raw15.empty:

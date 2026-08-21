@@ -46,6 +46,7 @@ def _candidate_meta(lv, schedules, post_ns, close0):
         touch_n = 0
         last_touch_age_h = np.nan
     return {
+        "candidate_valid": True,
         "level_id": int(lv.level_id),
         "level_price": float(lv.price),
         "period": int(lv.period),
@@ -53,6 +54,30 @@ def _candidate_meta(lv, schedules, post_ns, close0):
         "last_touch_age_h": float(last_touch_age_h) if np.isfinite(last_touch_age_h) else np.nan,
         "touch_n": int(touch_n),
         "touch_error_pct": float(lv.touch_error_pct),
+    }
+
+
+def _placeholder(r, qid, t, pair, tf, pub, c0, source):
+    return {
+        "candidate_valid": False,
+        "level_id": -1,
+        "level_price": np.nan,
+        "period": np.nan,
+        "distance_bps": np.nan,
+        "last_touch_age_h": np.nan,
+        "touch_n": np.nan,
+        "touch_error_pct": np.nan,
+        "query_id": qid,
+        "post_id": int(r["post_id"]),
+        "post_time": t,
+        "pair": pair,
+        "tf": tf,
+        "published_level_no": int(r.get("published_level_no", 0)),
+        "published_level": pub,
+        "post_close": c0,
+        "data_source": source,
+        "match_error_bps": np.nan,
+        "is_source_match25": False,
     }
 
 
@@ -80,6 +105,7 @@ def audit_group(records, config_path, datadir_s, warmup_days):
         schedules = {lv.level_id: _touch_schedule(lv, pivots, sig_ns, close) for lv in levels}
 
         rows = []
+        query_n = 0
         for r in records:
             t = pd.Timestamp(r["post_time"])
             post_ns = int(t.value)
@@ -87,6 +113,7 @@ def audit_group(records, config_path, datadir_s, warmup_days):
             idx = int(np.searchsorted(sig_ns, post_ns, side="right") - 1)
             if idx < 1 or idx >= len(close) or not np.isfinite(close[idx]) or close[idx] <= 0:
                 continue
+            query_n += 1
             c0 = float(close[idx])
             expected_kind = "R" if pub >= c0 else "S"
             formed = [lv for lv in levels if pd.Timestamp(lv.formed_time).value <= post_ns]
@@ -97,6 +124,9 @@ def audit_group(records, config_path, datadir_s, warmup_days):
                 and ((lv.kind == "R" and lv.price >= c0) or (lv.kind == "S" and lv.price <= c0))
             ]
             qid = f"{int(r['post_id'])}:{int(r.get('published_level_no', 0))}:{pair}:{tf}"
+            if not candidates:
+                rows.append(_placeholder(r, qid, t, pair, tf, pub, c0, source))
+                continue
             for lv in candidates:
                 z = _candidate_meta(lv, schedules, post_ns, c0)
                 z.update({
@@ -117,6 +147,7 @@ def audit_group(records, config_path, datadir_s, warmup_days):
             "pair": pair,
             "tf": tf,
             "status": "OK",
+            "queries": query_n,
             "rows": len(rows),
             "levels": len(levels),
             "elapsed_s": time.monotonic() - t0,
@@ -129,15 +160,22 @@ def _add_query_ranks(c: pd.DataFrame) -> pd.DataFrame:
     if c.empty:
         return c
     out = c.copy()
-    g = out.groupby("query_id", sort=False)
-    out["f_distance"] = g["distance_bps"].rank(method="average", ascending=True, pct=True)
-    rec = pd.to_numeric(out["last_touch_age_h"], errors="coerce")
-    rec_fill = rec.fillna(np.inf)
-    out["_rec_fill"] = rec_fill
-    out["f_recency"] = out.groupby("query_id", sort=False)["_rec_fill"].rank(method="average", ascending=True, pct=True)
-    out["f_touch"] = g["touch_n"].rank(method="average", ascending=False, pct=True)
-    out["f_period30"] = (pd.to_numeric(out["period"], errors="coerce") == 30).astype(float)
-    return out.drop(columns=["_rec_fill"])
+    valid = out["candidate_valid"].astype(bool)
+    v = out[valid].copy()
+    if not v.empty:
+        g = v.groupby("query_id", sort=False)
+        v["f_distance"] = g["distance_bps"].rank(method="average", ascending=True, pct=True)
+        v["_rec_fill"] = pd.to_numeric(v["last_touch_age_h"], errors="coerce").fillna(np.inf)
+        v["f_recency"] = v.groupby("query_id", sort=False)["_rec_fill"].rank(method="average", ascending=True, pct=True)
+        v["f_touch"] = g["touch_n"].rank(method="average", ascending=False, pct=True)
+        v["f_period30"] = (pd.to_numeric(v["period"], errors="coerce") == 30).astype(float)
+        v = v.drop(columns=["_rec_fill"])
+        for col in ("f_distance", "f_recency", "f_touch", "f_period30"):
+            out.loc[v.index, col] = v[col]
+    for col in ("f_distance", "f_recency", "f_touch", "f_period30"):
+        if col not in out:
+            out[col] = np.nan
+    return out
 
 
 def _score(c: pd.DataFrame, weights):
@@ -156,10 +194,25 @@ def _score(c: pd.DataFrame, weights):
 def _query_eval(c: pd.DataFrame, score_col: str) -> pd.DataFrame:
     rows = []
     for qid, g in c.groupby("query_id", sort=False):
-        gg = g.sort_values([score_col, "distance_bps", "last_touch_age_h", "level_id"], ascending=[True, True, True, True], na_position="last")
+        r0 = g.iloc[0]
+        gg = g[g["candidate_valid"].astype(bool)].copy()
+        if gg.empty:
+            rows.append({
+                "query_id": qid,
+                "post_id": int(r0.post_id),
+                "post_time": r0.post_time,
+                "pair": r0.pair,
+                "tf": r0.tf,
+                "published_level": float(r0.published_level),
+                "candidate_n": 0,
+                "covered25": False,
+                "best_rank": np.nan,
+                "rr": 0.0,
+            })
+            continue
+        gg = gg.sort_values([score_col, "distance_bps", "last_touch_age_h", "level_id"], ascending=[True, True, True, True], na_position="last")
         pos = np.flatnonzero(gg["is_source_match25"].to_numpy(bool))
         best_rank = int(pos[0] + 1) if len(pos) else np.nan
-        r0 = gg.iloc[0]
         rows.append({
             "query_id": qid,
             "post_id": int(r0.post_id),
@@ -199,11 +252,20 @@ def _fmt_metrics(label, q):
     )
 
 
-def _evaluate_weights(c: pd.DataFrame, weights):
-    z = c.copy()
-    z["score"] = _score(z, weights)
-    q = _query_eval(z, "score")
-    return _metrics(q)["mrr"], q
+def _fast_train_mrr(c: pd.DataFrame, weights) -> float:
+    # Grid fitting only. Use deterministic tiny tie-breaks so repeated integer weights do not depend on row order.
+    valid = c[c["candidate_valid"].astype(bool)].copy()
+    query_ids = pd.Index(c["query_id"].drop_duplicates())
+    if valid.empty:
+        return 0.0
+    s = _score(valid, weights)
+    s = s + 1e-8 * valid["f_distance"].to_numpy(float) + 1e-10 * valid["f_recency"].to_numpy(float)
+    valid["_score"] = s
+    valid["_rank"] = valid.groupby("query_id", sort=False)["_score"].rank(method="first", ascending=True)
+    pos = valid[valid["is_source_match25"].astype(bool)]
+    best = pos.groupby("query_id", sort=False)["_rank"].min()
+    rr = (1.0 / best).reindex(query_ids).fillna(0.0)
+    return float(rr.mean())
 
 
 def _fit_grid(train: pd.DataFrame):
@@ -216,15 +278,13 @@ def _fit_grid(train: pd.DataFrame):
             w = (wd, wr, wt, wp)
             if sum(w) == 0:
                 continue
-            mrr, _ = _evaluate_weights(train, w)
+            mrr = _fast_train_mrr(train, w)
             grid.append({"w_distance": wd, "w_recency": wr, "w_touch": wt, "w_period30": wp, "train_mrr": mrr})
             if mrr > best_mrr + 1e-12:
                 best_mrr = mrr
                 best = w
-            elif abs(mrr - best_mrr) <= 1e-12 and best is not None:
-                # Prefer simpler/tighter weights when train MRR ties.
-                if (sum(w), w) < (sum(best), best):
-                    best = w
+            elif abs(mrr - best_mrr) <= 1e-12 and best is not None and (sum(w), w) < (sum(best), best):
+                best = w
     return best, pd.DataFrame(grid).sort_values(["train_mrr", "w_distance", "w_recency"], ascending=[False, True, True])
 
 
@@ -280,12 +340,12 @@ def main():
             metas.append(meta)
             elapsed = time.monotonic() - t0
             eta = elapsed * (len(futs) - done) / done if done else np.nan
-            print(f"V4.5 {done:3d}/{len(futs)} {meta.get('pair','')} {meta.get('tf','')} status={meta.get('status')} candidates={len(rows)} elapsed={elapsed:.1f}s ETA={eta:.1f}s", flush=True)
+            print(f"V4.5 {done:3d}/{len(futs)} {meta.get('pair','')} {meta.get('tf','')} status={meta.get('status')} queries={meta.get('queries',0)} rows={len(rows)} elapsed={elapsed:.1f}s ETA={eta:.1f}s", flush=True)
 
     pd.DataFrame(metas).to_csv(outdir / "coverage.csv", index=False)
     c = pd.DataFrame(results)
     if c.empty:
-        print("No candidate rows.", flush=True)
+        print("No candidate/query rows.", flush=True)
         return 2
     c["post_time"] = pd.to_datetime(c.post_time, utc=True, errors="coerce")
     c = _add_query_ranks(c)
@@ -305,7 +365,7 @@ def main():
 
     print("\n=== CHRONOLOGICAL SPLIT ===", flush=True)
     print(f"LOW_TF unique posts={len(uq)} | train posts={len(train_post_ids)} | holdout posts={len(hold_post_ids)} | first holdout time={cutoff_time}", flush=True)
-    print(f"candidate rows train={len(train):,} holdout={len(hold):,}", flush=True)
+    print(f"candidate/query rows train={len(train):,} holdout={len(hold):,}", flush=True)
 
     baselines = {
         "DISTANCE_ONLY": (1, 0, 0, 0),
@@ -319,17 +379,21 @@ def main():
     print(f"TRAIN-SELECTED WEIGHTS distance={best[0]} recency={best[1]} touch={best[2]} period30_penalty={best[3]}", flush=True)
 
     print("\n=== SELECTOR TRAIN VS UNTOUCHED HOLDOUT ===", flush=True)
+    selected_train = None
+    selected_hold = None
     for name, w in {**baselines, "TRAIN_SELECTED": best}.items():
         tq = _queries_from_weights(train, w)
         hq = _queries_from_weights(hold, w)
         _fmt_metrics(f"TRAIN {name}", tq)
         _fmt_metrics(f"HOLD  {name}", hq)
         if name == "TRAIN_SELECTED":
+            selected_train = tq
+            selected_hold = hq
             tq.to_csv(outdir / "train_queries_selected.csv", index=False)
             hq.to_csv(outdir / "holdout_queries_selected.csv", index=False)
 
-    selected_hold = _queries_from_weights(hold, best)
-    train_keys_df = train[["pair", "tf", "published_level"]].drop_duplicates()
+    assert selected_train is not None and selected_hold is not None
+    train_keys_df = selected_train[["pair", "tf", "published_level"]].drop_duplicates()
     train_keys = {(str(r.pair), str(r.tf), round(float(r.published_level), 12)) for r in train_keys_df.itertuples(index=False)}
     novel = _novel_holdout(selected_hold, train_keys)
     print("\n=== HOLDOUT ROBUSTNESS ===", flush=True)

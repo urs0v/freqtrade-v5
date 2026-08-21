@@ -17,8 +17,8 @@ if [[ "$MODE" == "frozen_fakeout" ]]; then
     exit 2
   fi
 
-  echo "FrozenFakeout deployment: parity PASS; starting causal signal feed."
-  PYTHONUNBUFFERED=1 python -u /opt/rmv5/tools/frozen_fakeout_signal_feed.py \
+  echo "FrozenFakeout deployment: parity PASS; starting persistent incremental causal feed."
+  PYTHONUNBUFFERED=1 python -u /opt/rmv5/tools/frozen_fakeout_signal_feed_v2.py \
     --loop \
     --outdir /freqtrade/user_data/frozen_fakeout_feed &
   FEED_PID=$!

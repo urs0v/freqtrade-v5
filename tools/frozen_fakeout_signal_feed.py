@@ -101,8 +101,8 @@ def _sync_tf(cfg: dict, datadir: Path, outdir: Path, pair: str, tf: str, now: pd
     if not fetched.empty:
         if tf == "5m":
             # Keep the currently-open 5m bar as an ENTRY STUB. detect_events()
-            # never processes the final row, so only its immutable open is used
-            # for the previous closed candle's next-open execution geometry.
+            # never processes the final row, so the previous closed candle can
+            # use this row's immutable open without reading its future close.
             current_open = now.floor("5min")
             fetched = fetched[fetched.date <= current_open].copy()
         else:
@@ -133,18 +133,6 @@ def _sync_tf(cfg: dict, datadir: Path, outdir: Path, pair: str, tf: str, now: pd
     )
 
 
-def _worker(pair: str, config: str, datadir_s: str, outdir_s: str, cutoff_s: str, now_s: str):
-    cfg = json.loads(Path(config).read_text())
-    datadir = Path(datadir_s)
-    outdir = Path(outdir_s)
-    now = pd.Timestamp(now_s)
-    cutoff = pd.Timestamp(cutoff_s)
-    raw5 = _load_cached_combined(cfg, datadir, outdir, pair, "5m")
-    raw15 = _load_cached_combined(cfg, datadir, outdir, pair, "15m")
-    rows = p2.compute_pair(pair, raw5, raw15, cutoff, now)
-    return rows
-
-
 def _load_cached_combined(cfg: dict, datadir: Path, outdir: Path, pair: str, tf: str) -> pd.DataFrame:
     cache = outdir / "market_cache" / tf / f"{p2.symbol(pair)}.csv"
     live = p2.read_csv_candles(cache)
@@ -164,18 +152,64 @@ def _load_cached_combined(cfg: dict, datadir: Path, outdir: Path, pair: str, tf:
     )
 
 
+def _worker(pair: str, config: str, datadir_s: str, outdir_s: str, cutoff_s: str, now_s: str):
+    cfg = json.loads(Path(config).read_text())
+    datadir = Path(datadir_s)
+    outdir = Path(outdir_s)
+    now = pd.Timestamp(now_s)
+    cutoff = pd.Timestamp(cutoff_s)
+    raw5 = _load_cached_combined(cfg, datadir, outdir, pair, "5m")
+    raw15 = _load_cached_combined(cfg, datadir, outdir, pair, "15m")
+    return p2.compute_pair(pair, raw5, raw15, cutoff, now)
+
+
+def _still_executable(r: pd.Series, checked_at: pd.Timestamp) -> tuple[bool, str]:
+    """Reject a signal if stop/target was already touched before Freqtrade can enter."""
+    try:
+        entry = pd.Timestamp(r["entry_time"])
+        pair = str(r["pair"])
+        side = int(float(r["side"]))
+        stop = float(r["stop_price"])
+        target = float(r["target_price"])
+        if checked_at.floor("5min") != entry:
+            return False, "STALE_BUCKET"
+        k = p2.fetch_klines(
+            pair,
+            "5m",
+            int(entry.timestamp() * 1000),
+            int(checked_at.timestamp() * 1000),
+        )
+        k = k[k.date.eq(entry)]
+        if k.empty:
+            return False, "NO_CURRENT_KLINE"
+        c = k.iloc[-1]
+        if side > 0:
+            if float(c.low) <= stop:
+                return False, "STOP_TOUCHED_PRE_ENTRY"
+            if float(c.high) >= target:
+                return False, "TARGET_TOUCHED_PRE_ENTRY"
+        else:
+            if float(c.high) >= stop:
+                return False, "STOP_TOUCHED_PRE_ENTRY"
+            if float(c.low) <= target:
+                return False, "TARGET_TOUCHED_PRE_ENTRY"
+        return True, "OK"
+    except Exception as e:
+        return False, f"RECHECK_ERROR:{type(e).__name__}"
+
+
 def run_once(a, cutoff: pd.Timestamp):
     out = Path(a.outdir)
     cfg = json.loads(Path(a.config).read_text())
     datadir = Path(a.datadir)
-    now = utc_now().floor("s")
-    bucket = now.floor("5min")
+    scan_started = utc_now().floor("s")
+    bucket = scan_started.floor("5min")
 
     sync_status = []
     for n, pair in enumerate(p2.FROZEN_PAIRS, 1):
         try:
-            x5 = _sync_tf(cfg, datadir, out, pair, "5m", now)
-            x15 = _sync_tf(cfg, datadir, out, pair, "15m", now)
+            x5 = _sync_tf(cfg, datadir, out, pair, "5m", scan_started)
+            _sync_tf(cfg, datadir, out, pair, "15m", scan_started)
             has_stub = bool(len(x5) and pd.Timestamp(x5.date.max()) == bucket)
             sync_status.append({"pair": pair, "status": "OK", "has_entry_stub": has_stub})
             print(f"sync {n:2d}/{len(p2.FROZEN_PAIRS)} {pair:24s} stub={int(has_stub)}", flush=True)
@@ -187,7 +221,7 @@ def run_once(a, cutoff: pd.Timestamp):
     rows = []
     with ProcessPoolExecutor(max_workers=max(1, min(int(a.workers), len(good) or 1))) as ex:
         futs = {
-            ex.submit(_worker, pair, a.config, a.datadir, a.outdir, cutoff.isoformat(), now.isoformat()): pair
+            ex.submit(_worker, pair, a.config, a.datadir, a.outdir, cutoff.isoformat(), scan_started.isoformat()): pair
             for pair in good
         }
         done = 0
@@ -212,31 +246,39 @@ def run_once(a, cutoff: pd.Timestamp):
         z["entry_time"] = pd.to_datetime(z["entry_time"], utc=True)
         z = z.drop_duplicates("signal_id", keep="last").sort_values(["entry_time", "pair"]).reset_index(drop=True)
 
-    z["published_at"] = now.isoformat()
+    checked_at = utc_now().floor("s")
+    z["published_at"] = checked_at.isoformat()
+    z["feed_eligible"] = False
+    z["feed_reason"] = "NOT_CURRENT"
     if len(z):
-        z["feed_eligible"] = (
+        candidate_mask = (
             z["entry_time"].eq(bucket)
             & z["status"].astype(str).eq("OPEN")
             & pd.to_numeric(z["risk_bps"], errors="coerce").between(p2.RISK_MIN_BPS, 3000.0)
         )
-        z["publish_delay_sec"] = (now - z["entry_time"]).dt.total_seconds()
+        for idx in z.index[candidate_mask]:
+            ok, reason = _still_executable(z.loc[idx], checked_at)
+            z.at[idx, "feed_eligible"] = bool(ok)
+            z.at[idx, "feed_reason"] = reason
+        z["publish_delay_sec"] = (checked_at - z["entry_time"]).dt.total_seconds()
     else:
-        z["feed_eligible"] = pd.Series(dtype=bool)
         z["publish_delay_sec"] = pd.Series(dtype=float)
 
-    active = z[z["feed_eligible"].astype(bool)].copy() if len(z) else z.copy()
+    active = z[z["feed_eligible"].eq(True)].copy() if len(z) else z.copy()
     _write_csv(z, out / "signals.csv")
     _write_csv(active, out / "active_signals.csv")
     _write_csv(pd.DataFrame(sync_status), out / "coverage.csv")
 
     summary = {
         "cutoff": cutoff.isoformat(),
-        "published_at": now.isoformat(),
+        "scan_started": scan_started.isoformat(),
+        "published_at": checked_at.isoformat(),
         "entry_bucket": bucket.isoformat(),
         "pairs_with_entry_stub": len(good),
         "signals_since_cutoff": int(len(z)),
         "active_for_freqtrade": int(len(active)),
         "active_ids": active["signal_id"].astype(str).tolist() if len(active) else [],
+        "publish_delay_sec": float((checked_at - bucket).total_seconds()),
     }
     (out / "snapshot.json").write_text(json.dumps(summary, indent=2))
     print("\n=== FROZEN FAKEOUT EXECUTABLE FEED ===", flush=True)
@@ -259,9 +301,8 @@ def main():
     while True:
         now = utc_now()
         bucket = now.floor("5min")
-        # Binance has the new kline open essentially immediately; 20s gives the
-        # feed enough time to fetch the immutable open while leaving most of the
-        # entry candle available for Freqtrade execution.
+        # 20 seconds gives Binance time to expose the immutable next-candle open.
+        # Freqtrade still receives most of the same 5m candle for real execution.
         if now.second >= 20 and bucket != last_bucket:
             try:
                 run_once(a, cutoff)

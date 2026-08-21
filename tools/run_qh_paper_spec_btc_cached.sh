@@ -4,16 +4,15 @@ set -euo pipefail
 START="${START:-2026-05-01}"
 END="${END:-2026-08-18}"
 ROOT="${ROOT:-/freqtrade/user_data/qh_edge}"
-
-for d in $(seq -f '%02g' 1 1); do :; done
+export START END ROOT
 
 python - <<'PY'
 from datetime import datetime, timedelta
 from pathlib import Path
 import os
-start=datetime.strptime(os.environ.get('START','2026-05-01'),'%Y-%m-%d').date()
-end=datetime.strptime(os.environ.get('END','2026-08-18'),'%Y-%m-%d').date()
-root=Path(os.environ.get('ROOT','/freqtrade/user_data/qh_edge'))
+start=datetime.strptime(os.environ['START'],'%Y-%m-%d').date()
+end=datetime.strptime(os.environ['END'],'%Y-%m-%d').date()
+root=Path(os.environ['ROOT'])
 missing=[]
 d=start
 while d<=end:

@@ -13,6 +13,8 @@ import digash_v3_common as dc
 from prospective_fakeout_v2 import FROZEN_PAIRS, HISTORY_START, compute_pair
 
 HIST_END_EXCLUSIVE = pd.Timestamp("2026-08-20", tz="UTC")
+MIN_RISK_BPS = 2.0
+MAX_RISK_BPS = 3000.0
 
 
 def parse_args():
@@ -55,6 +57,26 @@ def metric(df, col):
     return len(r), pf, float(r.mean())
 
 
+def executable_frame(df: pd.DataFrame):
+    """Mirror the frozen V1/V2 executable-outcome domain.
+
+    V1.6 selected rows by activity/risk lower bound, but `_simulate_one()` still
+    returns NaN for stops outside its frozen 2..3000bps admissible risk range.
+    The prospective engine intentionally does not emit those non-executable rows.
+    Parity therefore compares the finite executable domain, while separately
+    requiring every excluded historical row to be explained by that same risk rule.
+    """
+    risk = pd.to_numeric(df.get("risk_bps"), errors="coerce")
+    r8 = pd.to_numeric(df.get("net8_r"), errors="coerce")
+    r12 = pd.to_numeric(df.get("stress12_r"), errors="coerce")
+    in_risk = risk.between(MIN_RISK_BPS, MAX_RISK_BPS, inclusive="both")
+    finite_r = np.isfinite(r8) & np.isfinite(r12)
+    keep = in_risk & finite_r
+    excluded = df.loc[~keep].copy()
+    unexplained = int((~keep & in_risk).sum())
+    return df.loc[keep].copy(), excluded, unexplained
+
+
 def main():
     a = parse_args()
     v16 = Path(a.v16dir) / "causal_selected.csv"
@@ -83,6 +105,11 @@ def main():
     got["entry_time"] = pd.to_datetime(got["entry_time"], utc=True)
     got = got[(got.entry_time >= HISTORY_START) & (got.entry_time < HIST_END_EXCLUSIVE)].copy()
 
+    ref_raw_n = len(ref)
+    got_raw_n = len(got)
+    ref, ref_excluded, ref_unexplained = executable_frame(ref)
+    got, got_excluded, got_unexplained = executable_frame(got)
+
     ref["key"] = key_frame(ref)
     got["key"] = key_frame(got)
     ref_keys = set(ref.key)
@@ -101,6 +128,19 @@ def main():
 
     rn, rpf, rexp = metric(ref, "net8_r")
     gn, gpf, gexp = metric(got, "net8_r")
+    print("\n=== PARITY DOMAIN SANITY ===")
+    print(
+        f"raw reference rows={ref_raw_n} | executable={len(ref)} | excluded_by_frozen_risk_domain={len(ref_excluded)} | "
+        f"unexplained_exclusions={ref_unexplained}"
+    )
+    print(
+        f"raw prospect rows={got_raw_n} | executable={len(got)} | excluded_by_frozen_risk_domain={len(got_excluded)} | "
+        f"unexplained_exclusions={got_unexplained}"
+    )
+    if len(ref_excluded):
+        rr = pd.to_numeric(ref_excluded["risk_bps"], errors="coerce")
+        print(f"reference excluded risk range: min={rr.min():.2f}bps max={rr.max():.2f}bps")
+
     print("\n=== PARITY RESULT ===")
     print(f"reference N={rn} PF={rpf:.6f} EXP={rexp:+.9f}R")
     print(f"prospect N={gn} PF={gpf:.6f} EXP={gexp:+.9f}R")
@@ -108,7 +148,9 @@ def main():
     print(f"matched max_abs_R_diff: 8bps={max8:.3g} 12bps={max12:.3g}")
 
     passed = (
-        len(ref) == len(got)
+        ref_unexplained == 0
+        and got_unexplained == 0
+        and len(ref) == len(got)
         and jac >= 0.999999
         and np.isfinite(max8) and max8 <= 1e-10
         and np.isfinite(max12) and max12 <= 1e-10
@@ -119,8 +161,14 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([{
         "verdict": verdict,
-        "reference_n": len(ref),
-        "prospective_n": len(got),
+        "reference_raw_n": ref_raw_n,
+        "prospective_raw_n": got_raw_n,
+        "reference_executable_n": len(ref),
+        "prospective_executable_n": len(got),
+        "reference_excluded": len(ref_excluded),
+        "prospective_excluded": len(got_excluded),
+        "reference_unexplained_exclusions": ref_unexplained,
+        "prospective_unexplained_exclusions": got_unexplained,
         "overlap": len(inter),
         "ref_only": len(ref_keys-inter),
         "prospective_only": len(got_keys-inter),
@@ -132,8 +180,14 @@ def main():
         "verdict": verdict,
         "history_start": HISTORY_START.isoformat(),
         "history_end_exclusive": HIST_END_EXCLUSIVE.isoformat(),
-        "reference_n": len(ref),
-        "prospective_n": len(got),
+        "reference_raw_n": ref_raw_n,
+        "prospective_raw_n": got_raw_n,
+        "reference_executable_n": len(ref),
+        "prospective_executable_n": len(got),
+        "reference_excluded": len(ref_excluded),
+        "prospective_excluded": len(got_excluded),
+        "reference_unexplained_exclusions": ref_unexplained,
+        "prospective_unexplained_exclusions": got_unexplained,
         "jaccard": jac,
         "max_abs_r_diff_8bps": max8,
         "max_abs_r_diff_12bps": max12,

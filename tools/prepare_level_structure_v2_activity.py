@@ -30,7 +30,7 @@ def load_pair(config: dict, datadir: Path, pair: str) -> pd.DataFrame:
     if d.empty:
         return d
     x = d[["date","open","high","low","close","volume"]].copy()
-    x["date"] = pd.to_datetime(x["date"], utc=True)
+    x["date"] = pd.to_datetime(x["date"], utc=True).astype("datetime64[ns, UTC]")
     x = x.sort_values("date").drop_duplicates("date")
     prev = x["close"].shift()
     tr = pd.concat([
@@ -48,7 +48,7 @@ def load_pair(config: dict, datadir: Path, pair: str) -> pd.DataFrame:
     x["quote_vol_24h"] = q24
     x["volume_anom"] = q1h / q1h_med.replace(0, np.nan)
     x["atr_pct"] = atr / x["close"]
-    x["signal_time"] = x["date"] + pd.Timedelta(minutes=15)
+    x["signal_time"] = (x["date"] + pd.Timedelta(minutes=15)).astype("datetime64[ns, UTC]")
     return x[["signal_time","ret_4h","ret_24h","quote_vol_24h","volume_anom","atr_pct"]]
 
 def main() -> int:
@@ -76,6 +76,7 @@ def main() -> int:
     if not frames:
         raise RuntimeError("No activity data")
     panel = pd.concat(frames, ignore_index=True)
+    panel["signal_time"] = pd.to_datetime(panel["signal_time"], utc=True).astype("datetime64[ns, UTC]")
 
     # Larger value = more active. Every feature is known at the just-closed 15m candle.
     panel["abs_ret_4h"] = panel["ret_4h"].abs()
@@ -101,7 +102,9 @@ def main() -> int:
     for pair, g in panel.groupby("pair", sort=False):
         safe = pair.replace("/", "_").replace(":", "_")
         path = outdir / f"{safe}.pkl"
-        g[keep].sort_values("signal_time").to_pickle(path)
+        out = g[keep].sort_values("signal_time").copy()
+        out["signal_time"] = pd.to_datetime(out["signal_time"], utc=True).astype("datetime64[ns, UTC]")
+        out.to_pickle(path)
         manifest.append({"pair": pair, "file": str(path), "rows": len(g)})
     pd.DataFrame(manifest).to_csv(outdir / "manifest.csv", index=False)
     print(f"ACTIVITY_DONE|pairs={len(manifest)}|rows={len(panel)}|out={outdir}", flush=True)

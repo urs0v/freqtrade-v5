@@ -5,7 +5,6 @@ import argparse
 import json
 import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +16,7 @@ BREAK_ATRS = (0.05, 0.10, 0.20)
 RV_MINS = (1.2, 1.4, 1.7)
 STOP_ATRS = (0.70, 0.85, 1.00)
 RRS = (1.5, 2.0, 2.5, 3.0)
-HOLD_BARS = (6, 12, 18)  # 30/60/90 min on 5m data
+HOLD_BARS = (6, 12, 18)  # 30/60/90m on 5m data
 COSTS_BPS = (8.0, 12.0, 20.0)
 RISK_PCTS = (1.5, 2.0, 2.5, 3.0)
 LEVERAGE = 10.0
@@ -56,7 +55,7 @@ def _atr14(df: pd.DataFrame) -> pd.Series:
     return tr.rolling(14, min_periods=14).mean()
 
 
-def _load_pair(datadir: Path, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+def _load_pair(datadir: Path, symbol: str, start: pd.Timestamp, end_day: pd.Timestamp) -> pd.DataFrame:
     path = datadir / f"{symbol}_USDT_USDT-5m-futures.feather"
     if not path.exists():
         raise FileNotFoundError(path)
@@ -69,7 +68,8 @@ def _load_pair(datadir: Path, symbol: str, start: pd.Timestamp, end: pd.Timestam
     x["date"] = pd.to_datetime(x["date"], utc=True)
     x = x.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     warm = start - pd.Timedelta(days=10)
-    x = x[(x.date >= warm) & (x.date < end + pd.Timedelta(days=1))].reset_index(drop=True)
+    end_excl = end_day + pd.Timedelta(days=1)
+    x = x[(x.date >= warm) & (x.date < end_excl)].reset_index(drop=True)
     for c in ("open", "high", "low", "close", "volume"):
         x[c] = pd.to_numeric(x[c], errors="coerce")
     return x.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
@@ -86,7 +86,7 @@ def _simulate_one(x: pd.DataFrame, entry_idx: int, side: int, risk_abs: float, r
         hi = float(bar["high"])
         stop_hit = lo <= stop if side > 0 else hi >= stop
         target_hit = hi >= target if side > 0 else lo <= target
-        # Pessimistic same-bar ordering: stop wins.
+        # Pessimistic same-candle ordering: stop wins.
         if stop_hit:
             return -1.0, j, "STOP"
         if target_hit:
@@ -99,15 +99,17 @@ def _simulate_one(x: pd.DataFrame, entry_idx: int, side: int, risk_abs: float, r
 def process_pair(symbol: str, datadir_s: str, start_s: str, end_s: str):
     datadir = Path(datadir_s)
     start = pd.Timestamp(start_s, tz="UTC")
-    end = pd.Timestamp(end_s, tz="UTC")
-    x = _load_pair(datadir, symbol, start, end)
+    end_day = pd.Timestamp(end_s, tz="UTC")
+    end_excl = end_day + pd.Timedelta(days=1)
+    x = _load_pair(datadir, symbol, start, end_day)
     if x.empty:
         return [], {"pair": symbol, "status": "NO_DATA"}
 
     x["atr14"] = _atr14(x)
     lr = np.log(x["close"] / x["close"].shift(1))
-    prior_rms_60m = np.sqrt((lr.shift(1).pow(2)).rolling(12, min_periods=12).mean())
+    prior_rms_60m = np.sqrt(lr.shift(1).pow(2).rolling(12, min_periods=12).mean())
     x["rv_ratio"] = lr.abs() / prior_rms_60m.replace(0, np.nan)
+    # Regime is deliberately independent of the breakout candle itself.
     x["mom_1h_prior"] = x["close"].shift(1) / x["close"].shift(13) - 1.0
     x["mom_4h_prior"] = x["close"].shift(1) / x["close"].shift(49) - 1.0
     x["vol_ratio20"] = x["volume"] / x["volume"].shift(1).rolling(20, min_periods=20).median()
@@ -118,10 +120,9 @@ def process_pair(symbol: str, datadir_s: str, start_s: str, end_s: str):
     rows = []
     min_break = min(BREAK_ATRS)
     min_rv = min(RV_MINS)
-    min_lb = min(LOOKBACKS)
-    for i in range(max(60, min_lb), len(x) - 1):
+    for i in range(60, len(x) - 1):
         t = pd.Timestamp(x.iloc[i]["date"])
-        if t < start or t > end:
+        if t < start or t >= end_excl:
             continue
         atr = float(x.iloc[i]["atr14"])
         rv = float(x.iloc[i]["rv_ratio"])
@@ -145,7 +146,7 @@ def process_pair(symbol: str, datadir_s: str, start_s: str, end_s: str):
             for side, level, break_atr in candidates:
                 entry_idx = i + 1
                 entry = float(x.iloc[entry_idx]["open"])
-                # Signal must still be valid at the first executable 5m price.
+                # Enter only if the breakout still exists at the first executable bar.
                 if side > 0 and entry <= level:
                     continue
                 if side < 0 and entry >= level:
@@ -204,6 +205,15 @@ def _pf(r: np.ndarray) -> float:
     return pos / neg if neg > 0 else math.inf
 
 
+def _calendar_months(period_start: pd.Timestamp, period_end: pd.Timestamp) -> int:
+    idx = pd.period_range(
+        period_start.tz_localize(None).to_period("M"),
+        (period_end - pd.Timedelta(seconds=1)).tz_localize(None).to_period("M"),
+        freq="M",
+    )
+    return max(1, len(idx))
+
+
 def _metrics(g: pd.DataFrame, gross_col: str, cost_bps: float, period_start: pd.Timestamp, period_end: pd.Timestamp):
     if g.empty:
         return {"n": 0, "pf": np.nan, "exp": np.nan, "wr": np.nan, "tpm": 0.0, "positive_quarters": 0.0}
@@ -215,11 +225,15 @@ def _metrics(g: pd.DataFrame, gross_col: str, cost_bps: float, period_start: pd.
     gg = g.iloc[np.flatnonzero(good)].copy()
     if len(r) == 0:
         return {"n": 0, "pf": np.nan, "exp": np.nan, "wr": np.nan, "tpm": 0.0, "positive_quarters": 0.0}
-    months = max(1, (period_end.year - period_start.year) * 12 + period_end.month - period_start.month)
-    qidx = pd.period_range(period_start.tz_localize(None).to_period("Q"), (period_end - pd.Timedelta(seconds=1)).tz_localize(None).to_period("Q"), freq="Q")
+    months = _calendar_months(period_start, period_end)
+    qidx = pd.period_range(
+        period_start.tz_localize(None).to_period("Q"),
+        (period_end - pd.Timedelta(seconds=1)).tz_localize(None).to_period("Q"),
+        freq="Q",
+    )
     qsum = pd.Series(0.0, index=qidx)
-    qp = gg["entry_time"].dt.tz_localize(None).dt.to_period("Q")
-    for q, val in pd.Series(r).groupby(qp.reset_index(drop=True)).sum().items():
+    qp = gg["entry_time"].dt.tz_localize(None).dt.to_period("Q").reset_index(drop=True)
+    for q, val in pd.Series(r).groupby(qp).sum().items():
         if q in qsum.index:
             qsum.loc[q] = float(val)
     return {
@@ -327,16 +341,13 @@ def _portfolio(g: pd.DataFrame, w: dict, cost_bps: float, risk_pct: float, start
     accepted = 0
     for _, row in x.iterrows():
         t = row.entry_time
-        still = []
-        for p in active:
-            if p["exit_time"] <= t:
-                equity += p["risk_amount"] * p["net_r"]
-                closed.append((p["exit_time"], equity))
-                peak = max(peak, equity)
-                maxdd = max(maxdd, (peak - equity) / peak if peak > 0 else 1.0)
-            else:
-                still.append(p)
-        active = still
+        eligible = sorted((p for p in active if p["exit_time"] <= t), key=lambda p: p["exit_time"])
+        active = [p for p in active if p["exit_time"] > t]
+        for p in eligible:
+            equity += p["risk_amount"] * p["net_r"]
+            closed.append((p["exit_time"], equity))
+            peak = max(peak, equity)
+            maxdd = max(maxdd, (peak - equity) / peak if peak > 0 else 1.0)
         if equity <= 0:
             break
         if any(p["pair"] == row.pair for p in active):
@@ -367,11 +378,15 @@ def _portfolio(g: pd.DataFrame, w: dict, cost_bps: float, risk_pct: float, start
         peak = max(peak, equity)
         maxdd = max(maxdd, (peak - equity) / peak if peak > 0 else 1.0)
 
-    month_index = pd.period_range(start.tz_localize(None).to_period("M"), (end - pd.Timedelta(seconds=1)).tz_localize(None).to_period("M"), freq="M")
-    month_end_equity = []
+    month_index = pd.period_range(
+        start.tz_localize(None).to_period("M"),
+        (end - pd.Timedelta(seconds=1)).tz_localize(None).to_period("M"),
+        freq="M",
+    )
     prev = START_EQUITY
     c = pd.DataFrame(closed, columns=["time", "equity"]) if closed else pd.DataFrame(columns=["time", "equity"])
     if not c.empty:
+        c = c.sort_values("time").reset_index(drop=True)
         c["month"] = pd.to_datetime(c.time, utc=True).dt.tz_localize(None).dt.to_period("M")
     rets = []
     for m in month_index:
@@ -382,7 +397,6 @@ def _portfolio(g: pd.DataFrame, w: dict, cost_bps: float, risk_pct: float, start
                 cur = float(cm.iloc[-1].equity)
         rets.append((cur / prev - 1.0) * 100.0 if prev > 0 else -100.0)
         prev = cur
-        month_end_equity.append(cur)
     return {
         "accepted": int(accepted),
         "final": float(equity),
@@ -400,14 +414,15 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     cache = outdir / "events.csv"
     start = pd.Timestamp(a.start, tz="UTC")
-    end = pd.Timestamp(a.end, tz="UTC")
+    end_day = pd.Timestamp(a.end, tz="UTC")
+    end_excl = end_day + pd.Timedelta(days=1)
 
     log("=== ALPHA CORE V1 — CAUSAL VOLATILITY BREAKOUT ===")
     log("Universe: BTC ETH SOL BNB XRP DOGE LINK | 5m 2022-2026 | research only")
     if cache.exists() and not a.rescan:
         log(f"reusing cached events: {cache}")
-        events = pd.read_csv(cache, parse_dates=["signal_time", "entry_time"] + [f"exit_rr{str(rr).replace('.', 'p')}_h{hb}" for rr in RRS for hb in HOLD_BARS])
-        coverage = pd.DataFrame()
+        date_cols = ["signal_time", "entry_time"] + [f"exit_rr{str(rr).replace('.', 'p')}_h{hb}" for rr in RRS for hb in HOLD_BARS]
+        events = pd.read_csv(cache, parse_dates=date_cols)
     else:
         all_rows = []
         metas = []
@@ -420,9 +435,9 @@ def main():
                 all_rows.extend(rows)
                 metas.append(meta)
                 log(f"pair {p}: {meta['status']} bars={meta.get('bars', 0):,} events={meta.get('events', 0):,}")
-        events = pd.DataFrame(all_rows)
         coverage = pd.DataFrame(metas).sort_values("pair")
         coverage.to_csv(outdir / "coverage.csv", index=False)
+        events = pd.DataFrame(all_rows)
         if events.empty:
             raise SystemExit("No events generated")
         events.to_csv(cache, index=False)
@@ -430,7 +445,8 @@ def main():
 
     events["signal_time"] = pd.to_datetime(events["signal_time"], utc=True)
     events["entry_time"] = pd.to_datetime(events["entry_time"], utc=True)
-    log(f"searching {len(events):,} event/stop rows across {len(LOOKBACKS)*len(BREAK_ATRS)*len(RV_MINS)*len(STOP_ATRS)*len(RRS)*len(HOLD_BARS):,} configs")
+    configs = len(LOOKBACKS) * len(BREAK_ATRS) * len(RV_MINS) * len(STOP_ATRS) * len(RRS) * len(HOLD_BARS)
+    log(f"searching {len(events):,} event/stop rows across {configs:,} configs")
     z = search(events, start)
     z.to_csv(outdir / "search.csv", index=False)
     if z.empty:
@@ -441,18 +457,24 @@ def main():
     g = _winner_events(events, w)
 
     hist = {}
+    rr = float(w["rr"])
+    hb = int(w["hold_bars"])
+    gross_col = f"gross_rr{str(rr).replace('.', 'p')}_h{hb}"
+    hist_g = g[(g.entry_time >= SELECT_END) & (g.entry_time < end_excl)]
     for cost in COSTS_BPS:
-        rr = float(w["rr"])
-        hb = int(w["hold_bars"])
-        col = f"gross_rr{str(rr).replace('.', 'p')}_h{hb}"
-        hist[str(int(cost))] = _metrics(g[(g.entry_time >= SELECT_END) & (g.entry_time <= end)], col, cost, SELECT_END, end + pd.Timedelta(days=1))
+        hist[str(int(cost))] = _metrics(hist_g, gross_col, cost, SELECT_END, end_excl)
 
     portfolio_rows = []
     for cost in COSTS_BPS:
         for rp in RISK_PCTS:
             selp = _portfolio(g, w, cost, rp, start, SELECT_END)
-            testp = _portfolio(g, w, cost, rp, SELECT_END, end + pd.Timedelta(days=1))
-            portfolio_rows.append({"cost_bps": cost, "risk_pct": rp, **{f"select_{k}": v for k, v in selp.items()}, **{f"hist2026_{k}": v for k, v in testp.items()}})
+            testp = _portfolio(g, w, cost, rp, SELECT_END, end_excl)
+            portfolio_rows.append({
+                "cost_bps": cost,
+                "risk_pct": rp,
+                **{f"select_{k}": v for k, v in selp.items()},
+                **{f"hist2026_{k}": v for k, v in testp.items()},
+            })
     portfolios = pd.DataFrame(portfolio_rows)
     portfolios.to_csv(outdir / "portfolio.csv", index=False)
 
@@ -463,13 +485,13 @@ def main():
         "selection_period": f"{a.start}..2025-12-31",
         "historical_2026_benchmark": f"2026-01-01..{a.end}",
         "2026_is_not_pristine_holdout": True,
-        "signal": "5m close breakout of prior N bars by ATR threshold; 5m volatility shock; prior 1h OR 4h momentum regime; next-5m-open execution; drift veto",
+        "signal": "5m close breakout of prior N bars by ATR threshold; current 5m volatility shock versus prior 60m RMS; prior 1h OR 4h momentum regime; next-5m-open execution; 0.35ATR drift veto",
         "cost_models_bps": list(COSTS_BPS),
         "promotion_gate": "PF12>=1.35, exp12>=0.20R, >=70% positive quarters, >=20 trades/month, exp20>0",
         "gate_pass": bool(gate_pass),
         "winner": w,
         "historical_2026_event_metrics": hist,
-        "best_portfolio_rows": portfolios.to_dict(orient="records"),
+        "portfolio_rows": portfolios.to_dict(orient="records"),
     }
     (outdir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
 

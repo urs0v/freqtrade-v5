@@ -3,7 +3,8 @@ set -euo pipefail
 
 OUT="/freqtrade/user_data/digash_v4_2_fidelity"
 SIM="$OUT/sim"
-mkdir -p "$OUT" "$SIM"
+EXEC_DIAG="$OUT/exec_diag"
+mkdir -p "$OUT" "$SIM" "$EXEC_DIAG"
 
 echo "=== DIGASH V4.2 QUALITY-FIRST FIDELITY + PNL REPLAY ==="
 echo "Detector first; post-signal replay second. Frequency is NOT an objective."
@@ -31,5 +32,16 @@ python /opt/rmv5/tools/digash_v4_2_sim.py \
   --max-hold-hours "${MAX_HOLD_HOURS:-24}"
 
 echo ""
+echo "=== STARTING EXECUTION DIAGNOSTICS ==="
+python /opt/rmv5/tools/digash_v4_2_exec_diag.py \
+  --events "$OUT/events.csv" \
+  --outdir "$EXEC_DIAG" \
+  --fee-bps-side "${FEE_BPS_SIDE:-5}" \
+  --slippage-bps-side "${SLIPPAGE_BPS_SIDE:-1}" \
+  --max-hold-hours "${MAX_HOLD_HOURS:-24}" \
+  --limit-minutes "${BOUNDARY_LIMIT_MINUTES:-15}"
+
+echo ""
 echo "Fidelity summary: $OUT/summary.json"
 echo "PnL replay summary: $SIM/summary.json"
+echo "Execution diagnostics: $EXEC_DIAG/summary.json"
